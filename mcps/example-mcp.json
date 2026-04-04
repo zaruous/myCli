@@ -1,0 +1,29 @@
+[
+  {
+    "path": "/api/users",
+    "method": "GET",
+    "response": {
+      "users": [
+        { "id": 1, "name": "John Doe" },
+        { "id": 2, "name": "Jane Doe" }
+      ]
+    }
+  },
+  {
+    "path": "/api/products/1",
+    "method": "GET",
+    "response": {
+      "id": 1,
+      "name": "Awesome Gadget",
+      "price": 99.99
+    }
+  },
+  {
+    "path": "/api/orders",
+    "method": "POST",
+    "response": {
+      "status": "success",
+      "orderId": 12345
+    }
+  }
+]

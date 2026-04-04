@@ -3,8 +3,13 @@
   "version": "1.0.0",
   "description": "My cli service.",
   "main": "index.js",
+  "type": "module",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "test": "node test/test-new-features.js",
+    "test:integration": "node test/test-integration.js",
+    "test:all": "node test/test-new-features.js && node test/test-integration.js",
+    "test:coverage": "c8 --reporter=text --reporter=html --include=index.js --include=lib/**/*.js node test/test-new-features.js"
   },
   "keywords": [],
   "author": "",
@@ -25,5 +30,8 @@
   },
   "bin": {
     "mycli": "./index.js"
+  },
+  "devDependencies": {
+    "c8": "^11.0.0"
   }
 }

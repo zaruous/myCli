@@ -1,0 +1,14 @@
+{
+  "_comment": "MCP 서버 연동 설정 예시. 실제 사용 시 이 파일을 복사해 수정하세요.",
+  "_format": {
+    "name": "서버 식별자 (영문, 하이픈 허용)",
+    "command": "서버 실행 명령어 (예: node server.js)",
+    "args": ["추가 인자 배열 (선택사항)"]
+  },
+  "_example": {
+    "name": "my-mcp-server",
+    "command": "node mcps/my-server.js",
+    "args": []
+  },
+  "_note": "실제 MCP 서버 설정은 example-mcp.json 이 아닌 별도 JSON 파일로 생성하세요. example-mcp.json과 이 파일은 자동으로 제외됩니다."
+}
