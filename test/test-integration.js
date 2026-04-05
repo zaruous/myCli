@@ -6,7 +6,7 @@
  *  - MYCLI_TEST=1 환경변수로 index.js 의 startCLI() 자동 실행을 차단
  *  - index.js 에서 export 된 baseTools / memory 를 동적 임포트로 가져옴
  *  - MockExecutor 로 실제 LLM API 호출 없이 streamEvents 흐름을 재현
- *  - inquirer.prompt 를 테스트별로 교체하여 대화형 확인 단계를 자동화
+ *  - lib/ui.js 의 setMockResponses/resetMock 으로 대화형 확인 단계를 자동화
  *
  * 실행: node test/test-integration.js
  */
@@ -19,9 +19,7 @@ import { fileURLToPath } from 'url';
 // lib 모듈 직접 임포트 (index.js 보다 먼저)
 import { planModeState, readFileState, setBaseDir, getBaseDir } from '../lib/state.js';
 import { getTimestamp } from '../lib/utils.js';
-
-// inquirer 싱글턴 참조 (index.js 와 동일 인스턴스)
-import inquirer from 'inquirer';
+import { setMockResponses, resetMock } from '../lib/ui.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const TMP_DIR   = path.join(__dirname, '__tmp_integration__');
@@ -63,31 +61,21 @@ async function teardown() {
   await fs.rm(TMP_DIR, { recursive: true, force: true });
 }
 
-// ── inquirer mock 유틸 ─────────────────────────────────────
-const _originalPrompt = inquirer.prompt.bind(inquirer);
-
-function withMockPrompt(responses, fn) {
+// ── UI mock 유틸 ───────────────────────────────────────────
+/**
+ * lib/ui.js 의 confirmPrompt / selectKeyPrompt / inputPrompt 를 자동화합니다.
+ * responses: 큐 배열 — 각 프롬프트 호출마다 앞에서부터 꺼냅니다.
+ *   - confirmPrompt → boolean (true/false)
+ *   - selectKeyPrompt → string (choice value, e.g. 'approve', 'reject')
+ *   - inputPrompt → string
+ */
+function withMockUI(responses, fn) {
   return async () => {
-    inquirer.prompt = async (questions) => {
-      const qs = Array.isArray(questions) ? questions : [questions];
-      const result = {};
-      for (const q of qs) {
-        if (q.name in responses) {
-          result[q.name] = responses[q.name];
-        } else if (q.type === 'confirm') {
-          result[q.name] = q.default !== undefined ? q.default : true;
-        } else if (q.type === 'expand') {
-          result[q.name] = q.choices?.[0]?.value ?? q.default ?? 'y';
-        } else {
-          result[q.name] = q.default ?? '';
-        }
-      }
-      return result;
-    };
+    setMockResponses(responses);
     try {
       return await fn();
     } finally {
-      inquirer.prompt = _originalPrompt;
+      resetMock();
     }
   };
 }
@@ -365,7 +353,7 @@ async function testWriteFileTool() {
     // read_file 로 읽어서 readFileState 등록
     await readTool.func({ filePath: testFile });
 
-    const testFn = withMockPrompt({ confirmed: true }, async () => {
+    const testFn = withMockUI([true], async () => {
       return await tool.func({ filePath: testFile, content: 'hello universe\n' });
     });
     const result = await testFn();
@@ -379,7 +367,7 @@ async function testWriteFileTool() {
     await fs.writeFile(testFile, original2, 'utf-8');
     await readTool.func({ filePath: testFile });
 
-    const testFn = withMockPrompt({ confirmed: false }, async () => {
+    const testFn = withMockUI([false], async () => {
       return await tool.func({ filePath: testFile, content: 'changed\n' });
     });
     await testFn();
@@ -435,7 +423,7 @@ async function testEditFileTool() {
   {
     await fs.writeFile(testFile, 'Hello World\n', 'utf-8');
     await readTool.func({ filePath: testFile });
-    const testFn = withMockPrompt({ confirmed: true }, async () => {
+    const testFn = withMockUI([true], async () => {
       return await tool.func({
         filePath: testFile, old_string: 'World', new_string: 'Universe',
       });
@@ -449,7 +437,7 @@ async function testEditFileTool() {
   {
     await fs.writeFile(testFile, 'aa bb aa\n', 'utf-8');
     await readTool.func({ filePath: testFile });
-    const testFn = withMockPrompt({ confirmed: true }, async () => {
+    const testFn = withMockUI([true], async () => {
       return await tool.func({
         filePath: testFile, old_string: 'aa', new_string: 'cc', replace_all: true,
       });
@@ -499,7 +487,7 @@ async function testPlanModeFlow() {
 
   // 6-5: exit_plan_mode 승인 → active=false
   {
-    const testFn = withMockPrompt({ decision: 'approve' }, async () => {
+    const testFn = withMockUI(['approve'], async () => {
       return await exitTool.func({ plan: '테스트 계획입니다.' });
     });
     const result = await testFn();
@@ -517,7 +505,7 @@ async function testPlanModeFlow() {
   // 6-7: exit_plan_mode 거절 → active 유지
   {
     await enterTool.func({});
-    const testFn = withMockPrompt({ decision: 'reject' }, async () => {
+    const testFn = withMockUI(['reject'], async () => {
       return await exitTool.func({ plan: '거절될 계획' });
     });
     const result = await testFn();
@@ -776,6 +764,127 @@ async function testMultiAttachParsing() {
 }
 
 // ═══════════════════════════════════════════════════════════
+// IT-11: execute_code 도구
+// ═══════════════════════════════════════════════════════════
+async function testExecuteCode() {
+  console.log('\n[IT-11] execute_code 도구');
+
+  const tool = getTool('execute_code');
+  if (!tool) {
+    console.log('  ⚠️  execute_code 도구 없음 (SKIP)');
+    return;
+  }
+
+  // 11-1: Plan Mode 차단
+  {
+    planModeState.active = true;
+    const result = await tool.func({
+      code: 'console.log("hi")',
+      description: 'test',
+      packages: [],
+      inputFiles: [],
+      outputFiles: [],
+    });
+    planModeState.active = false;
+    assert(result.includes('차단됨') || result.includes('Plan Mode'),
+      'IT-11-1: Plan Mode 중 execute_code 차단');
+  }
+
+  // 11-2: 사용자 취소 → 실행 안 됨
+  {
+    const testFn = withMockUI([false], async () => {
+      return await tool.func({
+        code: 'console.log("should not run")',
+        description: '취소 테스트',
+        packages: [],
+        inputFiles: [],
+        outputFiles: [],
+      });
+    });
+    const result = await testFn();
+    assert(result.includes('취소') || result.includes('cancel') || result.includes('않'),
+      'IT-11-2: 확인 거부 → 실행 취소 메시지');
+  }
+
+  // 11-3: 간단한 코드 실행 성공
+  {
+    const testFn = withMockUI([true], async () => {
+      return await tool.func({
+        code: 'console.log("execute_code_test_ok")',
+        description: '기본 실행 테스트',
+        packages: [],
+        inputFiles: [],
+        outputFiles: [],
+        timeout: 10000,
+      });
+    });
+    const result = await testFn();
+    assert(result.includes('execute_code_test_ok') || result.includes('완료') || result.includes('성공'),
+      'IT-11-3: 간단한 console.log 코드 실행 성공');
+  }
+
+  // 11-4: 코드 오류 → 에러 메시지 반환
+  {
+    const testFn = withMockUI([true], async () => {
+      return await tool.func({
+        code: 'throw new Error("intentional_error_42")',
+        description: '에러 테스트',
+        packages: [],
+        inputFiles: [],
+        outputFiles: [],
+        timeout: 10000,
+      });
+    });
+    const result = await testFn();
+    assert(result.includes('intentional_error_42') || result.includes('오류') || result.includes('STDERR'),
+      'IT-11-4: 코드 오류 → STDERR 또는 오류 메시지 포함');
+  }
+
+  // 11-5: description 필드가 표시에 활용됨 (함수 시그니처 검증)
+  {
+    const schema = tool.schema || tool.inputSchema || {};
+    const hasDescription = JSON.stringify(schema).includes('description');
+    assert(hasDescription, 'IT-11-5: schema에 description 필드 포함');
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
+// IT-12: install_package 도구
+// ═══════════════════════════════════════════════════════════
+async function testInstallPackage() {
+  console.log('\n[IT-12] install_package 도구');
+
+  const tool = getTool('install_package');
+  if (!tool) {
+    console.log('  ⚠️  install_package 도구 없음 (SKIP)');
+    return;
+  }
+
+  // 12-1: 소형 패키지(is-odd) 설치 → 성공 메시지
+  {
+    const result = await tool.func({ packages: ['is-odd'] });
+    assert(
+      result.includes('설치') || result.includes('완료') || result.includes('added') || result.includes('up to date'),
+      'IT-12-1: 패키지 설치 성공 메시지 반환'
+    );
+  }
+
+  // 12-2: 결과가 문자열 타입
+  {
+    const result = await tool.func({ packages: ['is-odd'] });
+    assert(typeof result === 'string' && result.length > 0,
+      'IT-12-2: 설치 결과가 비어 있지 않은 문자열');
+  }
+
+  // 12-3: schema에 packages 필드 포함
+  {
+    const schema = tool.schema || tool.inputSchema || {};
+    const hasPackages = JSON.stringify(schema).includes('packages');
+    assert(hasPackages, 'IT-12-3: schema에 packages 필드 포함');
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
 // 전체 실행
 // ═══════════════════════════════════════════════════════════
 async function main() {
@@ -795,13 +904,15 @@ async function main() {
     await testGitTools();
     await testMultilineParsingLogic();
     await testMultiAttachParsing();
+    await testExecuteCode();
+    await testInstallPackage();
   } finally {
     await teardown();
     await memory.clear();
     // 상태 정리
     planModeState.active = false;
     planModeState.enteredAt = null;
-    inquirer.prompt = _originalPrompt;
+    resetMock();
   }
 
   console.log('\n' + chalk_bold('='.repeat(55)));

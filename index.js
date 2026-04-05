@@ -8,7 +8,6 @@
  * 슬래시 명령어 → lib/commands.js
  * 스피너      → lib/ui.js
  */
-import inquirer from "inquirer";
 import search from "./search/search/dist/index.js";
 import fs from "fs/promises";
 import path from "path";
@@ -19,12 +18,12 @@ import { Command } from 'commander';
 
 import { getBaseDir, planModeState } from './lib/state.js';
 import { getSafePath } from './lib/utils.js';
-import { loadHistory, saveHistory } from './lib/history.js';
+import { loadHistory, saveHistory, getHistory } from './lib/history.js';
 import { loadSkills } from './lib/skills.js';
 import { loadProjectContext } from './lib/context.js';
 import { loadMcpTools } from './lib/mcp.js';
 import { loadAliases, resolveAlias, suggestCommand } from './lib/ux-manager.js';
-import { startSpinner, updateSpinner, stopSpinner } from './lib/ui.js';
+import { startSpinner, updateSpinner, stopSpinner, promptWithHistory, confirmPrompt, inputPrompt } from './lib/ui.js';
 import { baseTools } from './lib/tools.js';
 import { memory, createAgentExecutor } from './lib/agent.js';
 import { registerCommands } from './lib/commands.js';
@@ -41,6 +40,9 @@ async function startCLI() {
   const mcpTools      = await loadMcpTools();
   await loadAliases();
 
+  if (process.env.MYCLI_WORKDIR) {
+    console.log(chalk.gray(`[작업공간] ${getBaseDir()}  (MYCLI_WORKDIR)`));
+  }
   if (projectContext) console.log(chalk.gray('[컨텍스트] 프로젝트 컨텍스트 파일이 로드되었습니다.'));
   if (mcpTools.length > 0) console.log(chalk.gray(`[MCP] ${mcpTools.length}개 MCP 도구가 로드되었습니다.`));
 
@@ -115,9 +117,9 @@ async function startCLI() {
   // =========================================================
   // handleChat
   // =========================================================
-  const handleChat = async (userInput) => {
+  const handleChat = async (userInput, { skipHistory = false } = {}) => {
     if (!userInput.trim()) { askQuestion(); return; }
-    await saveHistory(userInput);
+    if (!skipHistory) await saveHistory(userInput);
 
     const controller   = new AbortController();
     const sigintHandler = () => {
@@ -146,8 +148,11 @@ async function startCLI() {
         } else if (event.event === 'on_tool_end') {
           updateSpinner('생각 중...');
         } else if (event.event === 'on_llm_stream') {
-          const chunk = event.data?.chunk?.message?.content ?? '';
-          if (typeof chunk === 'string' && chunk) {
+          const raw   = event.data?.chunk?.message?.content ?? '';
+          const chunk = Array.isArray(raw)
+            ? raw.map(c => (typeof c === 'string' ? c : (c?.text ?? ''))).join('')
+            : typeof raw === 'string' ? raw : '';
+          if (chunk) {
             if (!streaming) {
               stopSpinner();
               process.stdout.write(`${chalk.blue.bold('🤖:')} `);
@@ -157,7 +162,10 @@ async function startCLI() {
             finalOutput += chunk;
           }
         } else if (event.event === 'on_chain_end' && event.name === 'AgentExecutor') {
-          if (!streaming) finalOutput = event.data?.output?.output ?? event.data?.output ?? '';
+          if (!streaming) {
+            const raw = event.data?.output?.output ?? event.data?.output ?? '';
+            finalOutput = typeof raw === 'string' ? raw : JSON.stringify(raw, null, 2);
+          }
         }
       }
 
@@ -229,11 +237,7 @@ async function startCLI() {
 
     let question = nonAtText;
     if (!question) {
-      const result = await inquirer.prompt([{
-        type: 'input', name: 'question',
-        message: chalk.cyan('첨부된 파일에 대해 질문하세요:'),
-      }]);
-      question = result.question;
+      question = await inputPrompt(chalk.cyan('첨부된 파일에 대해 질문하세요:'));
     }
 
     if (!question) {
@@ -242,7 +246,7 @@ async function startCLI() {
       return;
     }
 
-    await handleChat(`다음 파일 내용을 참고하여 질문에 답해주세요:\n\n${fileSections.join('\n\n')}\n\n[질문]\n${question}`);
+    await handleChat(`다음 파일 내용을 참고하여 질문에 답해주세요:\n\n${fileSections.join('\n\n')}\n\n[질문]\n${question}`, { skipHistory: true });
   };
 
   // =========================================================
@@ -250,13 +254,11 @@ async function startCLI() {
   // =========================================================
   const askQuestion = async () => {
     try {
-      const { userInput: rawLine } = await inquirer.prompt([{
-        type:    'input',
-        name:    'userInput',
-        message: planModeState.active
-          ? chalk.cyan.bold('KYJ_AI [계획모드] >')
-          : chalk.green.bold('KYJ_AI >'),
-      }]);
+      const prompt = planModeState.active
+        ? chalk.cyan.bold('KYJ_AI [계획모드] >')
+        : chalk.green.bold('KYJ_AI >');
+      const slashCmds = program.commands.map(c => '/' + c.name());
+      const rawLine = await promptWithHistory(prompt, getHistory(), slashCmds, selectFile);
 
       // 멀티라인 모드: """ 로 시작하면 종료 """ 까지 수집
       let userInput = rawLine;
@@ -264,7 +266,7 @@ async function startCLI() {
         console.log(chalk.gray('  (멀티라인 모드: 입력 완료 후 새 줄에 """ 입력)'));
         const lines = [];
         while (true) {
-          const { line } = await inquirer.prompt([{ type: 'input', name: 'line', message: chalk.gray('  ...') }]);
+          const line = await inputPrompt(chalk.gray('  ...'));
           if (line.trim() === '"""') break;
           lines.push(line);
         }
@@ -302,7 +304,7 @@ async function startCLI() {
             askQuestion();
           }
         }
-      } else if (firstArg.startsWith('@')) {
+      } else if (processInput.includes('@')) {
         await handleAttach(userInput);
       } else {
         await handleChat(userInput);
@@ -310,10 +312,7 @@ async function startCLI() {
 
     } catch (error) {
       if (error?.name === 'ExitPromptError') {
-        const { confirmExit } = await inquirer.prompt([{
-          type: 'confirm', name: 'confirmExit',
-          message: '정말로 종료하시겠습니까?', default: true,
-        }]);
+        const confirmExit = await confirmPrompt('정말로 종료하시겠습니까?');
         if (confirmExit) {
           console.log(chalk.yellow('프로그램을 종료합니다. 안녕히 계세요!'));
           process.exit(0);
