@@ -14,11 +14,13 @@ import { fileURLToPath } from 'url';
 import { spawn } from 'child_process';
 
 // ── lib 모듈 직접 임포트 ────────────────────────────────────
-import { getBaseDir, setBaseDir, planModeState, readFileState } from '../lib/state.js';
+import { getBaseDir, setBaseDir, planModeState, readFileState, getCurrentInput, setCurrentInput } from '../lib/state.js';
 import { getSafePath, getTimestamp } from '../lib/utils.js';
 import { computeLineDiff, renderDiffWithContext } from '../lib/diff.js';
 import { loadSkills } from '../lib/skills.js';
 import { loadProjectContext } from '../lib/context.js';
+import { loadHooks, emitHook, getLoadedHooks } from '../lib/hooks.js';
+import { initHookLogger, logHookEvent, queryHookEvents, countHookEvents, clearHookEvents, isLoggerReady, closeHookLogger } from '../lib/hook-logger.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const TMP_DIR = path.join(__dirname, '__tmp__');
@@ -652,6 +654,528 @@ async function testLibModulesCoverage() {
 }
 
 // ═══════════════════════════════════════════════════════════
+// Test 23: state.js — getCurrentInput / setCurrentInput
+// ═══════════════════════════════════════════════════════════
+async function testCurrentInput() {
+  console.log('\n[Test 23] state.js — getCurrentInput / setCurrentInput');
+
+  // 23-1: 초기값 빈 문자열
+  setCurrentInput('');
+  assert(getCurrentInput() === '', '23-1: 초기값 빈 문자열');
+
+  // 23-2: 값 설정 후 조회
+  setCurrentInput('안녕하세요');
+  assert(getCurrentInput() === '안녕하세요', '23-2: setCurrentInput 후 getCurrentInput 반환');
+
+  // 23-3: 덮어쓰기
+  setCurrentInput('두 번째 입력');
+  assert(getCurrentInput() === '두 번째 입력', '23-3: 값 덮어쓰기');
+
+  // 23-4: 빈 문자열 재설정
+  setCurrentInput('');
+  assert(getCurrentInput() === '', '23-4: 빈 문자열 재설정');
+}
+
+// ═══════════════════════════════════════════════════════════
+// Test 24: lib/hooks.js — 로더, matcher, emitHook, 차단 로직
+// ═══════════════════════════════════════════════════════════
+async function testHooks() {
+  console.log('\n[Test 24] lib/hooks.js — 훅 시스템');
+
+  // 24-1: loadHooks — hooks.json 없으면 빈 객체
+  await loadHooks();
+  const loaded = getLoadedHooks();
+  assert(typeof loaded === 'object' && loaded !== null, '24-1: loadHooks 후 객체 반환');
+
+  // 24-2: getLoadedHooks 참조 일치
+  assert(getLoadedHooks() === loaded, '24-2: getLoadedHooks 동일 참조 반환');
+
+  // 24-3: hooks.json 로컬 파일 로드 테스트
+  {
+    const localDir = path.join(TMP_DIR, '.mycli');
+    await fs.mkdir(localDir, { recursive: true });
+    await fs.writeFile(
+      path.join(localDir, 'hooks.json'),
+      JSON.stringify({
+        hooks: {
+          PreToolCall: [{ matcher: 'read_file', hooks: [{ type: 'command', command: 'echo HOOK_TEST' }] }],
+        },
+      }),
+      'utf-8'
+    );
+    // cwd를 TMP_DIR로 변경하여 로컬 hooks.json 로드 검증
+    const origCwd = process.cwd();
+    process.chdir(TMP_DIR);
+    await loadHooks();
+    const h = getLoadedHooks();
+    process.chdir(origCwd);
+    // 다시 빈 상태로 복구
+    await loadHooks();
+    assert(Array.isArray(h.PreToolCall) && h.PreToolCall.length > 0, '24-3: 로컬 hooks.json PreToolCall 로드');
+  }
+
+  // 24-4: matcher 정규식 — 일치 시 훅 실행 (stdout 캡처)
+  {
+    // 임시로 _hooks를 직접 조작하여 테스트
+    const hooksModule = await import('../lib/hooks.js');
+
+    // loadHooks를 빈 상태로 리셋 (hooks.json 없는 cwd 사용)
+    await loadHooks();
+
+    // emitHook 기본 동작: 훅 없으면 blocked=false
+    const result = await emitHook('PreToolCall', {
+      MYCLI_TOOL_NAME: 'read_file',
+      MYCLI_INPUT: 'test',
+      MYCLI_BASE_DIR: TMP_DIR,
+      MYCLI_PROVIDER: 'gemini',
+    });
+    assert(result.blocked === false, '24-4: 훅 없으면 blocked=false');
+    assert(typeof result.output === 'string', '24-4: output 문자열 반환');
+  }
+
+  // 24-5: emitHook Stop — blocked 항상 false
+  {
+    await loadHooks();
+    const result = await emitHook('Stop', {
+      MYCLI_INPUT: 'hello',
+      MYCLI_OUTPUT: 'world',
+      MYCLI_BASE_DIR: TMP_DIR,
+      MYCLI_PROVIDER: 'gemini',
+    });
+    assert(result.blocked === false, '24-5: Stop 이벤트 blocked 항상 false');
+  }
+
+  // 24-6: emitHook PreUserPromptSubmit — blocked 항상 false
+  {
+    await loadHooks();
+    const result = await emitHook('PreUserPromptSubmit', {
+      MYCLI_INPUT: '테스트 입력',
+      MYCLI_BASE_DIR: TMP_DIR,
+      MYCLI_PROVIDER: 'gpt',
+    });
+    assert(result.blocked === false, '24-6: PreUserPromptSubmit blocked 항상 false');
+  }
+
+  // 24-7: matcher 정규식 잘못된 패턴 — 예외 없이 skip
+  {
+    const localDir = path.join(TMP_DIR, '.mycli');
+    await fs.mkdir(localDir, { recursive: true });
+    await fs.writeFile(
+      path.join(localDir, 'hooks.json'),
+      JSON.stringify({
+        hooks: {
+          PreToolCall: [{ matcher: '[invalid', hooks: [{ command: 'echo hi' }] }],
+        },
+      }),
+      'utf-8'
+    );
+    const origCwd = process.cwd();
+    process.chdir(TMP_DIR);
+    await loadHooks();
+    process.chdir(origCwd);
+
+    let threw = false;
+    try {
+      await emitHook('PreToolCall', {
+        MYCLI_TOOL_NAME: 'write_file',
+        MYCLI_INPUT: 'x',
+        MYCLI_BASE_DIR: TMP_DIR,
+        MYCLI_PROVIDER: 'gemini',
+      });
+    } catch { threw = true; }
+    assert(!threw, '24-7: 잘못된 matcher 정규식 → 예외 없이 skip');
+
+    await loadHooks(); // 리셋
+  }
+
+  // 24-8: PreToolCall exit code 0 → 차단 없음
+  {
+    const localDir = path.join(TMP_DIR, '.mycli');
+    await fs.mkdir(localDir, { recursive: true });
+    await fs.writeFile(
+      path.join(localDir, 'hooks.json'),
+      JSON.stringify({
+        hooks: {
+          PreToolCall: [{ matcher: '.*', hooks: [{ command: 'exit 0' }] }],
+        },
+      }),
+      'utf-8'
+    );
+    const origCwd = process.cwd();
+    process.chdir(TMP_DIR);
+    await loadHooks();
+    process.chdir(origCwd);
+
+    const result = await emitHook('PreToolCall', {
+      MYCLI_TOOL_NAME: 'read_file',
+      MYCLI_INPUT: 'x',
+      MYCLI_BASE_DIR: TMP_DIR,
+      MYCLI_PROVIDER: 'gemini',
+    });
+    assert(result.blocked === false, '24-8: PreToolCall exit 0 → 차단 없음');
+    await loadHooks();
+  }
+
+  // 24-9: PreToolCall exit code 1 → 차단
+  {
+    const localDir = path.join(TMP_DIR, '.mycli');
+    await fs.mkdir(localDir, { recursive: true });
+    await fs.writeFile(
+      path.join(localDir, 'hooks.json'),
+      JSON.stringify({
+        hooks: {
+          PreToolCall: [{ matcher: '.*', hooks: [{ command: 'exit 1' }] }],
+        },
+      }),
+      'utf-8'
+    );
+    const origCwd = process.cwd();
+    process.chdir(TMP_DIR);
+    await loadHooks();
+    process.chdir(origCwd);
+
+    const result = await emitHook('PreToolCall', {
+      MYCLI_TOOL_NAME: 'write_file',
+      MYCLI_INPUT: 'x',
+      MYCLI_BASE_DIR: TMP_DIR,
+      MYCLI_PROVIDER: 'gemini',
+    });
+    assert(result.blocked === true, '24-9: PreToolCall exit 1 → blocked=true');
+    await loadHooks();
+  }
+
+  // 24-10: stdout 캡처 — echo 명령어 결과 output 에 포함
+  {
+    const localDir = path.join(TMP_DIR, '.mycli');
+    await fs.mkdir(localDir, { recursive: true });
+    await fs.writeFile(
+      path.join(localDir, 'hooks.json'),
+      JSON.stringify({
+        hooks: {
+          Stop: [{ matcher: '.*', hooks: [{ command: 'echo CAPTURED_OUTPUT' }] }],
+        },
+      }),
+      'utf-8'
+    );
+    const origCwd = process.cwd();
+    process.chdir(TMP_DIR);
+    await loadHooks();
+    process.chdir(origCwd);
+
+    const result = await emitHook('Stop', {
+      MYCLI_INPUT: 'x',
+      MYCLI_OUTPUT: 'y',
+      MYCLI_BASE_DIR: TMP_DIR,
+      MYCLI_PROVIDER: 'gemini',
+    });
+    assert(result.output.includes('CAPTURED_OUTPUT'), '24-10: stdout 캡처 → output 포함');
+    await loadHooks();
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
+// Test 25: lib/hook-logger.js — SQLite 로거
+// ═══════════════════════════════════════════════════════════
+async function testHookLogger() {
+  console.log('\n[Test 25] lib/hook-logger.js — SQLite 로거');
+
+  // 25-1: 테스트 전용 DB 경로 사용
+  const testDbPath = path.join(TMP_DIR, 'test-hook-log.db');
+  process.env.MYCLI_HOOK_LOG = 'true';
+  process.env.MYCLI_HOOK_LOG_DB = testDbPath;
+
+  await initHookLogger();
+  assert(isLoggerReady(), '25-1: initHookLogger 후 isLoggerReady()=true');
+
+  // 25-2: 초기 상태 — 레코드 없음
+  const initial = queryHookEvents({ limit: 100 });
+  // 이전 테스트에서 emitHook이 호출했을 수 있으므로 clearHookEvents 후 확인
+  clearHookEvents();
+  const afterClear = queryHookEvents({ limit: 100 });
+  assert(afterClear.length === 0, '25-2: clearHookEvents 후 레코드 없음');
+
+  // 25-3: PreUserPromptSubmit 이벤트 기록
+  logHookEvent({
+    MYCLI_EVENT:    'PreUserPromptSubmit',
+    MYCLI_INPUT:    '안녕하세요',
+    MYCLI_BASE_DIR: '/tmp',
+    MYCLI_PROVIDER: 'gemini',
+  });
+  const rows1 = queryHookEvents({ limit: 10 });
+  assert(rows1.length === 1, '25-3: 이벤트 1건 기록');
+  assert(rows1[0].event === 'PreUserPromptSubmit', '25-3: event 컬럼 정확');
+  assert(rows1[0].user_input === '안녕하세요', '25-3: user_input 컬럼 정확');
+  assert(rows1[0].provider === 'gemini', '25-3: provider 컬럼 정확');
+
+  // 25-4: PreToolCall 이벤트 기록
+  logHookEvent({
+    MYCLI_EVENT:      'PreToolCall',
+    MYCLI_TOOL_NAME:  'read_file',
+    MYCLI_TOOL_INPUT: JSON.stringify({ filePath: 'test.js' }),
+    MYCLI_INPUT:      '파일 읽어줘',
+    MYCLI_BASE_DIR:   '/tmp',
+    MYCLI_PROVIDER:   'gpt',
+  });
+  const rows2 = queryHookEvents({ limit: 10 });
+  assert(rows2.length === 2, '25-4: PreToolCall 기록 후 총 2건');
+  assert(rows2[0].tool_name === 'read_file', '25-4: tool_name 컬럼 정확 (최신순)');
+
+  // 25-5: PostToolCall 이벤트 기록
+  logHookEvent({
+    MYCLI_EVENT:        'PostToolCall',
+    MYCLI_TOOL_NAME:    'read_file',
+    MYCLI_TOOL_INPUT:   JSON.stringify({ filePath: 'test.js' }),
+    MYCLI_TOOL_OUTPUT:  '파일 내용입니다',
+    MYCLI_INPUT:        '파일 읽어줘',
+    MYCLI_BASE_DIR:     '/tmp',
+    MYCLI_PROVIDER:     'gpt',
+  });
+  const rows3 = queryHookEvents({ limit: 10 });
+  assert(rows3.length === 3, '25-5: PostToolCall 기록 후 총 3건');
+  assert(rows3[0].tool_output === '파일 내용입니다', '25-5: tool_output 컬럼 정확');
+
+  // 25-6: Stop 이벤트 기록
+  logHookEvent({
+    MYCLI_EVENT:    'Stop',
+    MYCLI_INPUT:    '파일 읽어줘',
+    MYCLI_OUTPUT:   'AI 응답 내용',
+    MYCLI_BASE_DIR: '/tmp',
+    MYCLI_PROVIDER: 'gpt',
+  });
+  const rows4 = queryHookEvents({ limit: 10 });
+  assert(rows4.length === 4, '25-6: Stop 기록 후 총 4건');
+  assert(rows4[0].ai_output === 'AI 응답 내용', '25-6: ai_output 컬럼 정확');
+
+  // 25-7: event 필터
+  const filtered = queryHookEvents({ event: 'PreToolCall', limit: 10 });
+  assert(filtered.length === 1 && filtered[0].event === 'PreToolCall', '25-7: event 필터 동작');
+
+  // 25-8: tool 필터
+  const toolFiltered = queryHookEvents({ tool: 'read_file', limit: 10 });
+  assert(toolFiltered.length === 2, '25-8: tool 필터 — read_file 2건 반환');
+
+  // 25-9: limit 동작
+  const limited = queryHookEvents({ limit: 2 });
+  assert(limited.length === 2, '25-9: limit=2 → 2건 반환');
+
+  // 25-10: countHookEvents 전체
+  const total = countHookEvents();
+  assert(total === 4, '25-10: countHookEvents 전체 4건');
+
+  // 25-11: countHookEvents event 필터
+  const cnt = countHookEvents({ event: 'Stop' });
+  assert(cnt === 1, '25-11: countHookEvents Stop 1건');
+
+  // 25-12: clearHookEvents 반환값 (삭제 건수)
+  const deleted = clearHookEvents();
+  assert(deleted === 4, '25-12: clearHookEvents 삭제 건수 4');
+
+  // 25-13: clear 후 빈 상태
+  const afterClear2 = queryHookEvents({ limit: 10 });
+  assert(afterClear2.length === 0, '25-13: clearHookEvents 후 0건');
+
+  // 25-14: countHookEvents clear 후 0
+  assert(countHookEvents() === 0, '25-14: countHookEvents clear 후 0');
+
+  // 25-15: MYCLI_HOOK_LOG=false 시 isLoggerReady 유지 (이미 init된 상태)
+  // (비활성화는 initHookLogger 호출 시에만 작동 — 이미 초기화된 db는 유지)
+  assert(isLoggerReady(), '25-15: 이미 초기화된 로거는 env 변경 후에도 db 유지');
+
+  // DB 연결 닫기 (teardown 시 EBUSY 방지)
+  closeHookLogger();
+  delete process.env.MYCLI_HOOK_LOG_DB;
+}
+
+// ═══════════════════════════════════════════════════════════
+// Test 26: 훅 시스템 엣지 케이스 (커버리지 보강)
+// ═══════════════════════════════════════════════════════════
+async function testHookEdgeCases() {
+  console.log('\n[Test 26] 훅 엣지 케이스 (타임아웃·stderr·초기화 실패)');
+
+  const localDir = path.join(TMP_DIR, '.mycli');
+  await fs.mkdir(localDir, { recursive: true });
+
+  // 26-1: 타임아웃 경로 — timeout 1ms + 느린 명령어 → timedOut=true, blocked=false
+  {
+    await fs.writeFile(
+      path.join(localDir, 'hooks.json'),
+      JSON.stringify({
+        hooks: {
+          Stop: [{
+            matcher: '.*',
+            hooks: [{ command: 'node -e "setTimeout(()=>{},200)"', timeout: 1 }],
+          }],
+        },
+      }),
+      'utf-8'
+    );
+    const origCwd = process.cwd();
+    process.chdir(TMP_DIR);
+    await loadHooks();
+    process.chdir(origCwd);
+
+    let threw = false;
+    let result;
+    try {
+      result = await emitHook('Stop', {
+        MYCLI_INPUT: 'x', MYCLI_OUTPUT: 'y',
+        MYCLI_BASE_DIR: TMP_DIR, MYCLI_PROVIDER: 'gemini',
+      });
+    } catch { threw = true; }
+    assert(!threw, '26-1: 타임아웃 발생해도 예외 없음');
+    assert(result?.blocked === false, '26-1: 타임아웃 → blocked=false (Stop 이벤트)');
+    await loadHooks();
+  }
+
+  // 26-2: PreToolCall 타임아웃 → blocked=false (차단 조건은 exitCode이지 timedOut 아님)
+  {
+    await fs.writeFile(
+      path.join(localDir, 'hooks.json'),
+      JSON.stringify({
+        hooks: {
+          PreToolCall: [{
+            matcher: '.*',
+            hooks: [{ command: 'node -e "setTimeout(()=>{},200)"', timeout: 1 }],
+          }],
+        },
+      }),
+      'utf-8'
+    );
+    const origCwd = process.cwd();
+    process.chdir(TMP_DIR);
+    await loadHooks();
+    process.chdir(origCwd);
+
+    const result = await emitHook('PreToolCall', {
+      MYCLI_TOOL_NAME: 'write_file', MYCLI_INPUT: 'x',
+      MYCLI_BASE_DIR: TMP_DIR, MYCLI_PROVIDER: 'gemini',
+    });
+    assert(result.blocked === false, '26-2: PreToolCall 타임아웃 → blocked=false');
+    await loadHooks();
+  }
+
+  // 26-3: stderr 출력 경로 — 명령어가 stderr에 출력
+  {
+    await fs.writeFile(
+      path.join(localDir, 'hooks.json'),
+      JSON.stringify({
+        hooks: {
+          Stop: [{
+            matcher: '.*',
+            hooks: [{ command: 'node -e "process.stderr.write(\'STDERR_MSG\')"' }],
+          }],
+        },
+      }),
+      'utf-8'
+    );
+    const origCwd = process.cwd();
+    process.chdir(TMP_DIR);
+    await loadHooks();
+    process.chdir(origCwd);
+
+    let threw = false;
+    try {
+      await emitHook('Stop', {
+        MYCLI_INPUT: 'x', MYCLI_OUTPUT: 'y',
+        MYCLI_BASE_DIR: TMP_DIR, MYCLI_PROVIDER: 'gemini',
+      });
+    } catch { threw = true; }
+    assert(!threw, '26-3: stderr 출력 명령어 → 예외 없음');
+    await loadHooks();
+  }
+
+  // 26-4: hook.type이 'command'가 아닌 경우 → skip
+  {
+    await fs.writeFile(
+      path.join(localDir, 'hooks.json'),
+      JSON.stringify({
+        hooks: {
+          Stop: [{
+            matcher: '.*',
+            hooks: [{ type: 'unsupported', command: 'echo SHOULD_NOT_RUN' }],
+          }],
+        },
+      }),
+      'utf-8'
+    );
+    const origCwd = process.cwd();
+    process.chdir(TMP_DIR);
+    await loadHooks();
+    process.chdir(origCwd);
+
+    const result = await emitHook('Stop', {
+      MYCLI_INPUT: 'x', MYCLI_OUTPUT: 'y',
+      MYCLI_BASE_DIR: TMP_DIR, MYCLI_PROVIDER: 'gemini',
+    });
+    assert(result.output === '', '26-4: 지원하지 않는 type → output 빈 문자열');
+    await loadHooks();
+  }
+
+  // 26-5: hook.command 없는 경우 → skip
+  {
+    await fs.writeFile(
+      path.join(localDir, 'hooks.json'),
+      JSON.stringify({
+        hooks: {
+          Stop: [{
+            matcher: '.*',
+            hooks: [{ type: 'command' }],
+          }],
+        },
+      }),
+      'utf-8'
+    );
+    const origCwd = process.cwd();
+    process.chdir(TMP_DIR);
+    await loadHooks();
+    process.chdir(origCwd);
+
+    let threw = false;
+    try {
+      await emitHook('Stop', {
+        MYCLI_INPUT: 'x', MYCLI_OUTPUT: 'y',
+        MYCLI_BASE_DIR: TMP_DIR, MYCLI_PROVIDER: 'gemini',
+      });
+    } catch { threw = true; }
+    assert(!threw, '26-5: command 없는 훅 → 예외 없음');
+    await loadHooks();
+  }
+
+  // 26-6: initHookLogger 실패 경로 — MYCLI_HOOK_LOG=false
+  {
+    const { closeHookLogger: close, initHookLogger: init, isLoggerReady: ready } =
+      await import('../lib/hook-logger.js');
+    close();
+    process.env.MYCLI_HOOK_LOG = 'false';
+    await init();
+    assert(!ready(), '26-6: MYCLI_HOOK_LOG=false → isLoggerReady=false');
+    process.env.MYCLI_HOOK_LOG = 'true';
+    process.env.MYCLI_HOOK_LOG_DB = path.join(TMP_DIR, 'recovery.db');
+    await init();
+    assert(ready(), '26-6: 복구 후 isLoggerReady=true');
+    close();
+    delete process.env.MYCLI_HOOK_LOG_DB;
+  }
+
+  // 26-7: initHookLogger — DB 경로가 디렉터리인 경우 catch 블록 진입
+  {
+    const { closeHookLogger: close, initHookLogger: init, isLoggerReady: ready } =
+      await import('../lib/hook-logger.js');
+    close();
+    // 디렉터리를 DB 경로로 지정 → better-sqlite3가 에러 던짐 → catch 블록
+    process.env.MYCLI_HOOK_LOG = 'true';
+    process.env.MYCLI_HOOK_LOG_DB = TMP_DIR; // 디렉터리
+    await init();
+    assert(!ready(), '26-7: DB 경로가 디렉터리 → 초기화 실패 → isLoggerReady=false');
+    // 복구
+    process.env.MYCLI_HOOK_LOG_DB = path.join(TMP_DIR, 'final-recovery.db');
+    await init();
+    close();
+    delete process.env.MYCLI_HOOK_LOG_DB;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
 // 실행
 // ═══════════════════════════════════════════════════════════
 async function run() {
@@ -671,6 +1195,10 @@ async function run() {
   await testStatusLogic();
   await testPlanModeNewTools();
   await testLibModulesCoverage();
+  await testCurrentInput();
+  await testHooks();
+  await testHookLogger();
+  await testHookEdgeCases();
 
   await teardown();
 

@@ -16,7 +16,7 @@ import { glob } from 'glob';
 import chalk from 'chalk';
 import { Command } from 'commander';
 
-import { getBaseDir, planModeState } from './lib/state.js';
+import { getBaseDir, planModeState, getCurrentInput, setCurrentInput } from './lib/state.js';
 import { getSafePath } from './lib/utils.js';
 import { loadHistory, saveHistory, getHistory } from './lib/history.js';
 import { loadSkills } from './lib/skills.js';
@@ -29,12 +29,54 @@ import { memory, createAgentExecutor } from './lib/agent.js';
 import { registerCommands } from './lib/commands.js';
 import { DynamicStructuredTool } from "@langchain/core/tools";
 import { z } from "zod";
+import { loadHooks, emitHook } from './lib/hooks.js';
+import { initHookLogger } from './lib/hook-logger.js';
+
+// =========================================================
+// startCLI
+// =========================================================
+// ─────────────────────────────────────────────────────────
+// 훅 래퍼 — baseTools 각 도구에 PreToolCall / PostToolCall 발행
+// ─────────────────────────────────────────────────────────
+function wrapWithHooks(tool, cliState) {
+  return new DynamicStructuredTool({
+    name:        tool.name,
+    description: tool.description,
+    schema:      tool.schema,
+    func: async (input) => {
+      const envVars = {
+        MYCLI_TOOL_NAME: tool.name,
+        MYCLI_TOOL_INPUT: JSON.stringify(input),
+        MYCLI_INPUT:    getCurrentInput(),
+        MYCLI_BASE_DIR: getBaseDir(),
+        MYCLI_PROVIDER: cliState.currentProvider,
+      };
+
+      const pre = await emitHook('PreToolCall', envVars);
+      if (pre.blocked) {
+        return `차단됨: PreToolCall 훅에 의해 '${tool.name}' 실행이 차단되었습니다.`;
+      }
+
+      const output = await tool.func(input);
+
+      await emitHook('PostToolCall', {
+        ...envVars,
+        MYCLI_TOOL_OUTPUT:    String(output),
+        MYCLI_TOOL_EXIT_CODE: '0',
+      });
+
+      return output;
+    },
+  });
+}
 
 // =========================================================
 // startCLI
 // =========================================================
 async function startCLI() {
   await loadHistory();
+  await loadHooks();
+  await initHookLogger();
   const skills        = await loadSkills();
   const projectContext = await loadProjectContext();
   const mcpTools      = await loadMcpTools();
@@ -70,8 +112,6 @@ async function startCLI() {
       })
     : null;
 
-  const tools = [...baseTools, ...mcpTools, ...(useSkillTool ? [useSkillTool] : [])];
-
   // ── 뮤터블 CLI 상태 ──────────────────────────────────────
   // 기본 provider: 환경변수 > API 키 자동 감지 순서
   let defaultProvider = process.env.MYCLI_PROVIDER || 'gemini';
@@ -81,15 +121,22 @@ async function startCLI() {
     console.log(chalk.yellow(`[경고] GOOGLE_API_KEY 없음 → '${defaultProvider}' 로 자동 전환`));
   }
 
+  // cliState 를 먼저 선언 (wrapWithHooks 가 currentProvider 를 런타임에 읽음)
   const cliState = {
     memory,
-    tools,
+    tools: [],          // 아래에서 채움
     skills,
     mcpTools,
     projectContext,
     currentProvider: defaultProvider,
-    executor: await createAgentExecutor(projectContext, tools, skills, defaultProvider),
+    executor: null,     // 아래에서 채움
   };
+
+  // baseTools 에 훅 래퍼 적용 후 최종 tools 배열 구성
+  const wrappedBase = baseTools.map(t => wrapWithHooks(t, cliState));
+  const tools = [...wrappedBase, ...mcpTools, ...(useSkillTool ? [useSkillTool] : [])];
+  cliState.tools    = tools;
+  cliState.executor = await createAgentExecutor(projectContext, tools, skills, defaultProvider);
 
   // ── Commander 초기화 ─────────────────────────────────────
   const program = new Command();
@@ -120,6 +167,16 @@ async function startCLI() {
   const handleChat = async (userInput, { skipHistory = false } = {}) => {
     if (!userInput.trim()) { askQuestion(); return; }
     if (!skipHistory) await saveHistory(userInput);
+
+    // 현재 입력 저장 (훅 MYCLI_INPUT 용)
+    setCurrentInput(userInput);
+
+    // PreUserPromptSubmit 훅 발행
+    await emitHook('PreUserPromptSubmit', {
+      MYCLI_INPUT:    userInput,
+      MYCLI_BASE_DIR: getBaseDir(),
+      MYCLI_PROVIDER: cliState.currentProvider,
+    });
 
     const controller   = new AbortController();
     const sigintHandler = () => {
@@ -177,6 +234,14 @@ async function startCLI() {
       }
       process.stdout.write('\n');
       await memory.saveContext({ input: userInput }, { output: String(finalOutput) });
+
+      // Stop 훅 발행
+      await emitHook('Stop', {
+        MYCLI_INPUT:    userInput,
+        MYCLI_OUTPUT:   finalOutput,
+        MYCLI_BASE_DIR: getBaseDir(),
+        MYCLI_PROVIDER: cliState.currentProvider,
+      });
 
     } catch (error) {
       stopSpinner();

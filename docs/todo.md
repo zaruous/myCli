@@ -27,6 +27,7 @@
 - [x] `edit_file` 도구 추가 — `old_string` → `new_string` 방식의 부분 수정 (전체 파일 교체 없이)
 - [x] 스트리밍 토큰 출력 — AI 응답을 실시간으로 한 글자씩 출력
 - [x] `execute_shell_command` UTF-8 인코딩 처리 — PowerShell 한글 깨짐 방지 (`chcp 65001`)
+- [x] `get_datetime` 도구 추가 — OS 현재 날짜·시간·타임존·ISO 8601·Unix 타임스탬프 반환
 
 ## 🟡 중간 우선순위
 
@@ -44,6 +45,201 @@
 - [x] 다중 파일 첨부 — `@` 로 여러 파일 동시 첨부
 - [x] Git 통합 도구 — `git_status`, `git_diff`, `git_log` 등 AI 도구 추가
 - [x] 멀티라인 입력 — 코드 블록·긴 텍스트 붙여넣기 지원
+
+## 🔵 Hook 시스템
+
+> 사용자가 정의한 셸 명령(hook)을 CLI 이벤트 수명주기의 특정 시점에 자동 실행.
+> Claude Code의 hooks와 동일한 개념: 이벤트 → 매처 → 커맨드 실행.
+
+### 설계
+
+#### 설정 파일
+- 위치: `~/.mycli/hooks.json` (전역) 또는 `.mycli/hooks.json` (프로젝트 로컬, 우선)
+- JSON 스키마:
+
+```json
+{
+  "hooks": {
+    "PreUserPromptSubmit": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          { "type": "command", "command": "echo '$MYCLI_INPUT' >> ~/mycli-input.log" }
+        ]
+      }
+    ],
+    "PreToolCall": [
+      {
+        "matcher": "write_file|execute_code",
+        "hooks": [
+          { "type": "command", "command": "node ~/.mycli/hooks/pre-tool.js" }
+        ]
+      }
+    ],
+    "PostToolCall": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          { "type": "command", "command": "node ~/.mycli/hooks/post-tool.js" }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          { "type": "command", "command": "notify-send 'KYJ CLI' 'AI 응답 완료'" }
+        ]
+      }
+    ]
+  }
+}
+```
+
+#### 이벤트 종류 및 환경변수
+
+**공통 (모든 이벤트)**
+| 변수 | 값 |
+|---|---|
+| `MYCLI_EVENT` | 이벤트 이름 (`PreToolCall` 등) |
+| `MYCLI_BASE_DIR` | 현재 작업 디렉터리 |
+| `MYCLI_PROVIDER` | 현재 모델 (`gemini` / `gpt` / `ollama`) |
+
+**`PreUserPromptSubmit`** — 사용자 입력이 AI로 전달되기 직전
+| 변수 | 값 |
+|---|---|
+| `MYCLI_INPUT` | 사용자 입력 문자열 |
+
+**`PreToolCall`** — AI 도구 실행 직전 (exit code ≠ 0 이면 실행 차단)
+| 변수 | 값 |
+|---|---|
+| `MYCLI_TOOL_NAME` | 도구 이름 (`write_file`, `execute_code` 등) |
+| `MYCLI_TOOL_INPUT` | 도구 입력 JSON 문자열 |
+| `MYCLI_INPUT` | 현재 턴의 원래 사용자 입력 |
+
+**`PostToolCall`** — AI 도구 실행 직후
+| 변수 | 값 |
+|---|---|
+| `MYCLI_TOOL_NAME` | 도구 이름 |
+| `MYCLI_TOOL_INPUT` | 도구 입력 JSON 문자열 |
+| `MYCLI_TOOL_OUTPUT` | 도구 실행 결과 문자열 |
+| `MYCLI_TOOL_EXIT_CODE` | 성공 여부 (`0` = 정상) |
+| `MYCLI_INPUT` | 현재 턴의 원래 사용자 입력 |
+
+**`Stop`** — AI 최종 응답 완료
+| 변수 | 값 |
+|---|---|
+| `MYCLI_OUTPUT` | AI 최종 응답 전체 텍스트 |
+| `MYCLI_INPUT` | 원래 사용자 입력 |
+
+#### 동작 규칙
+- `matcher`: 이벤트별 키 문자열(도구명, 입력 등)에 대해 정규식 테스트. 통과 시 hooks 배열 순차 실행
+- hook 프로세스가 **0이 아닌 exit code**로 종료되면 해당 이벤트를 **차단** (PreToolCall만 해당)
+- hook의 **stdout**은 `MYCLI_HOOK_OUTPUT` 변수로 다음 hook에 전달. PostToolCall/Stop에서는 AI 컨텍스트에 주입 가능 (옵션)
+- hook 실행 타임아웃: 기본 10초 (설정 가능: `"timeout": 5000`)
+- 실행 오류(ENOENT 등)는 경고만 출력, CLI 중단 없음
+
+#### 파일 구조
+
+```
+lib/
+  hooks.js          ← 신규: Hook 로더 · 이벤트 발행 · 실행 엔진
+  hook-logger.js    ← 신규: SQLite 내역 기록 (빌트인 훅)
+index.js            ← PreUserPromptSubmit, Stop 훅 발행 지점 추가
+lib/tools.js        ← PreToolCall / PostToolCall 발행 지점 추가 (baseTools wrapper)
+~/.mycli/
+  hooks.json        ← 전역 훅 설정
+  hook-log.db       ← SQLite 로그 DB
+```
+
+#### `lib/hooks.js` 주요 API
+
+```js
+// 훅 설정 로드 (startCLI에서 호출)
+export async function loadHooks(): Promise<void>
+
+// 이벤트 발행 — 해당 이벤트의 모든 훅을 순차 실행
+// returns: { blocked: boolean, output: string }
+export async function emitHook(event: string, env: Record<string, string>): Promise<HookResult>
+```
+
+---
+
+### 빌트인 훅: SQLite 이벤트 로거
+
+> `MYCLI_HOOK_LOG=true` (기본값)일 때 모든 이벤트를 `~/.mycli/hook-log.db`에 자동 기록.
+> `lib/hook-logger.js`가 `emitHook` 내부에서 사용자 훅과 별도로 항상 먼저 실행됨.
+
+#### .env 설정 변수
+
+```dotenv
+# 훅 이벤트 SQLite 기록 (기본 활성화)
+MYCLI_HOOK_LOG=true
+
+# 로그 DB 경로 (기본: ~/.mycli/hook-log.db)
+MYCLI_HOOK_LOG_DB=
+```
+
+#### DB 스키마 (`hook_events` 테이블)
+
+```sql
+CREATE TABLE IF NOT EXISTS hook_events (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  event       TEXT    NOT NULL,               -- PreToolCall 등
+  tool_name   TEXT,                           -- PreToolCall/PostToolCall 전용
+  tool_input  TEXT,                           -- JSON 문자열
+  tool_output TEXT,                           -- PostToolCall 전용
+  user_input  TEXT,                           -- 해당 턴의 사용자 입력
+  ai_output   TEXT,                           -- Stop 전용
+  provider    TEXT,                           -- gemini / gpt / ollama
+  base_dir    TEXT,
+  created_at  DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+#### `lib/hook-logger.js` 주요 API
+
+```js
+// DB 초기화 (startCLI에서 loadHooks 직후 호출)
+export async function initHookLogger(): Promise<void>
+
+// 이벤트 1건 기록 (emitHook 내부에서 자동 호출)
+export async function logHookEvent(env: Record<string, string>): Promise<void>
+```
+
+#### `/hook-log` 슬래시 명령어
+
+```
+/hook-log            최근 20건 테이블 출력
+/hook-log --event PreToolCall   특정 이벤트만 필터
+/hook-log --tool write_file     특정 도구만 필터
+/hook-log --limit 50            출력 건수 지정
+/hook-log --clear               전체 로그 삭제 (확인 프롬프트)
+```
+
+### 구현 체크리스트
+
+- [x] `lib/hooks.js` — 훅 로더 및 실행 엔진 구현
+  - 전역 + 로컬 hooks.json 로드 (로컬 우선 merge)
+  - matcher 정규식 테스트
+  - 환경변수 주입하여 `spawn` 실행
+  - exit code 기반 차단 / stdout 캡처
+  - 타임아웃 처리
+- [x] `lib/hook-logger.js` — SQLite 빌트인 로거 구현
+  - `better-sqlite3` 패키지 사용 (동기 API로 단순하게)
+  - `MYCLI_HOOK_LOG` 환경변수로 활성화 여부 제어 (기본 `true`)
+  - `MYCLI_HOOK_LOG_DB` 환경변수로 DB 경로 오버라이드
+  - `initHookLogger()` — 테이블 생성 (없으면)
+  - `logHookEvent(env)` — 이벤트 1건 INSERT
+- [x] `.env.example` — `MYCLI_HOOK_LOG`, `MYCLI_HOOK_LOG_DB` 항목 추가
+- [x] `index.js` — `PreUserPromptSubmit` 훅 발행 (`handleChat` 진입 시)
+- [x] `index.js` — `Stop` 훅 발행 (AI 최종 응답 완료 후)
+- [x] `lib/tools.js` — `baseTools` 각 도구에 `PreToolCall` / `PostToolCall` 훅 발행 래퍼 적용
+- [x] `lib/commands.js` — `/hook-log` 슬래시 명령어 구현 (필터·페이지네이션)
+- [x] `/hooks` 슬래시 명령어 — 현재 로드된 훅 목록 출력
+- [x] `/hooks`, `/hook-log` 명령어를 `/help` 목록에 추가
+- [x] 훅 실행 시 `chalk.gray('[훅]')` 로그 출력 (verbose 옵션 고려)
+- [x] 타임아웃·오류 발생 시 경고 출력, CLI 계속 진행
 
 ## 🔵 코드 매니저 & UX 관리자
 
