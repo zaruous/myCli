@@ -1,26 +1,44 @@
 {
   "_comment": "MCP 서버 연동 설정 예시. 실제 사용 시 이 파일을 복사해 수정하세요.",
+
   "_format_stdio": {
     "name": "서버 식별자 (영문, 하이픈 허용)",
     "command": "서버 실행 명령어 (예: node server.js)",
     "args": ["추가 인자 배열 (선택사항)"]
   },
+
   "_format_http": {
-    "name": "서버 식별자 (영문, 하이픈 허용)",
+    "name": "서버 식별자",
     "url": "HTTP 엔드포인트 URL (예: http://localhost:3000/mcp)",
-    "headers": { "Authorization": "Bearer <token> (선택사항)" }
+    "token": "Bearer 토큰 — 지정 시 Authorization: Bearer <token> 헤더 자동 추가 (선택사항)",
+    "headers": { "X-Custom-Header": "추가 헤더 (선택사항, token보다 낮은 우선순위)" }
   },
+
   "_example_stdio": {
     "name": "my-mcp-server",
     "command": "node mcps/my-server.js",
     "args": []
   },
-  "_example_http": {
+
+  "_example_http_no_auth": {
     "name": "my-http-mcp",
-    "url": "http://localhost:3000/mcp",
+    "url": "http://localhost:3000/mcp"
+  },
+
+  "_example_http_token": {
+    "name": "my-secured-mcp",
+    "url": "https://api.example.com/mcp",
+    "token": "mySecretToken123"
+  },
+
+  "_example_http_custom_headers": {
+    "name": "my-enterprise-mcp",
+    "url": "https://internal.example.com/mcp",
+    "token": "bearerToken",
     "headers": {
-      "Authorization": "Bearer mytoken"
+      "X-Tenant-ID": "my-org"
     }
   },
+
   "_note": "실제 MCP 서버 설정은 별도 JSON 파일로 생성하세요. example-mcp.json과 이 파일은 자동으로 제외됩니다."
 }
