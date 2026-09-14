@@ -17,7 +17,7 @@ import { fileURLToPath } from 'url';
 process.env.MYCLI_TEST     = '1';
 process.env.MYCLI_HOOK_LOG = 'false';
 
-import { setBaseDir, getBaseDir, planModeState, readFileState } from '../lib/state.js';
+import { setBaseDir, getBaseDir, planModeState, readFileState, approvedOutsideReads } from '../lib/state.js';
 import { getSafePath, toBaseRelative } from '../lib/utils.js';
 import { setMockResponses, resetMock } from '../lib/ui.js';
 import { baseTools } from '../lib/tools.js';
@@ -50,6 +50,7 @@ async function setup() {
   setBaseDir(TMP_DIR);
   planModeState.active = false;
   readFileState.clear();
+  approvedOutsideReads.clear();
   resetMock();
 }
 
@@ -528,6 +529,69 @@ async function testAgentMode() {
 }
 
 // ═══════════════════════════════════════════════════════════
+// R-12 read_file: 사용자가 요청한 BASE_DIR 밖 절대경로 읽기
+//     (기존: 사용자가 명시적으로 요청해도 무조건 차단)
+// ═══════════════════════════════════════════════════════════
+async function testOutsideAbsoluteRead() {
+  console.log('\n[R-12] 작업 디렉터리 밖 절대경로 읽기');
+
+  const allowPath = path.join(SIBLING, 'outside-allow.txt');
+  const denyPath  = path.join(SIBLING, 'outside-deny.txt');
+  await fs.writeFile(allowPath, 'OUTSIDE ALLOW', 'utf-8');
+  await fs.writeFile(denyPath,  'OUTSIDE DENY',  'utf-8');
+
+  // R-12-1: 절대경로 + 사용자 승인 → 읽기 성공
+  {
+    setMockResponses([true]);
+    const out = await tool('read_file').func({ filePath: allowPath });
+    assert(out.includes('OUTSIDE ALLOW'), 'R-12-1: 승인 시 밖 절대경로 읽기 성공');
+  }
+
+  // R-12-2: 사용자가 거부하면 내용이 새어 나오지 않음
+  {
+    setMockResponses([false]);
+    const out = await tool('read_file').func({ filePath: denyPath });
+    assert(!out.includes('OUTSIDE DENY'), 'R-12-2: 거부 시 내용 유출 없음');
+  }
+
+  // R-12-3: 한 번 승인한 경로는 재확인 없이 읽힘
+  //         (빈 mock 큐 = 프롬프트가 뜨면 기본값 N 으로 거부됨)
+  {
+    setMockResponses([]);
+    const out = await tool('read_file').func({ filePath: allowPath });
+    assert(out.includes('OUTSIDE ALLOW'), 'R-12-3: 승인된 경로는 재확인 생략');
+  }
+
+  // R-12-4: 상대경로 탈출은 승인 여부·승인 캐시와 무관하게 계속 차단
+  //         (allowPath 와 같은 파일을 '..' 로 가리켜도 뚫리면 안 된다)
+  {
+    setMockResponses([true, true]);
+    const escapeRel = path.join('..', path.basename(SIBLING), 'outside-allow.txt');
+    const out = await tool('read_file').func({ filePath: escapeRel });
+    assert(!out.includes('OUTSIDE ALLOW'), 'R-12-4: 상대경로 탈출은 계속 차단');
+  }
+
+  // R-12-5: 읽기를 승인한 밖 경로라도 write_file 은 계속 차단
+  {
+    setMockResponses([true, true]);
+    await tool('write_file').func({ filePath: allowPath, content: 'HACKED' });
+    const after = await fs.readFile(allowPath, 'utf-8');
+    assert(after === 'OUTSIDE ALLOW', 'R-12-5: 승인된 밖 경로도 write_file 차단');
+  }
+
+  // R-12-6: edit_file 도 계속 차단
+  {
+    setMockResponses([true, true]);
+    await tool('edit_file').func({ filePath: allowPath, old_string: 'OUTSIDE', new_string: 'HACKED' });
+    const after = await fs.readFile(allowPath, 'utf-8');
+    assert(after === 'OUTSIDE ALLOW', 'R-12-6: 승인된 밖 경로도 edit_file 차단');
+  }
+
+  resetMock();
+  approvedOutsideReads.clear();
+}
+
+// ═══════════════════════════════════════════════════════════
 async function main() {
   console.log('\x1b[1m' + '='.repeat(55) + '\x1b[0m');
   console.log('  mycli 회귀 테스트 (실제 재현된 버그)');
@@ -546,6 +610,7 @@ async function main() {
     await testConfigDiscovery();
     await testMemoryTrim();
     await testAgentMode();
+    await testOutsideAbsoluteRead();
   } finally {
     await teardown();
   }
