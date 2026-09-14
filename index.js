@@ -16,14 +16,14 @@ import { glob } from 'glob';
 import chalk from 'chalk';
 import { Command } from 'commander';
 
-import { getBaseDir, planModeState, getCurrentInput, setCurrentInput } from './lib/state.js';
+import { getBaseDir, planModeState, displayState, getCurrentInput, setCurrentInput } from './lib/state.js';
 import { getSafePath, toBaseRelative } from './lib/utils.js';
 import { loadHistory, saveHistory, getHistory } from './lib/history.js';
 import { loadSkills } from './lib/skills.js';
 import { loadProjectContext } from './lib/context.js';
 import { loadMcpTools } from './lib/mcp.js';
 import { loadAliases, resolveAlias, suggestCommand } from './lib/ux-manager.js';
-import { startSpinner, updateSpinner, stopSpinner, promptWithHistory, confirmPrompt, inputPrompt } from './lib/ui.js';
+import { startSpinner, updateSpinner, stopSpinner, printTrace, promptWithHistory, confirmPrompt, inputPrompt } from './lib/ui.js';
 import { baseTools } from './lib/tools.js';
 import { memory, createAgentExecutor, trimMemory } from './lib/agent.js';
 import { registerCommands } from './lib/commands.js';
@@ -125,7 +125,14 @@ async function startCLI() {
             return `알 수 없는 스킬: "${normalizedName}"\n\nAI 호출 가능한 스킬:\n${list}`;
           }
           const expanded = found.prompt.replace(/\$ARGUMENTS/g, args || '');
-          console.log(chalk.gray(`[스킬] '${found.name}' 실행 중...`));
+          if (displayState.skills) {
+            // 펼침: 모델에 주입되는 스킬 프롬프트 전문을 보여준다 (/skills 로 전환)
+            stopSpinner();
+            printTrace(`[스킬] '${found.name}' 로드됨 — 주입 프롬프트:`, expanded, Infinity);
+            startSpinner('툴 실행: use_skill');
+          } else {
+            console.log(chalk.gray(`[스킬] '${found.name}' 실행 중...`));
+          }
           return `[스킬 '${found.name}' 로드됨]\n\n${expanded}`;
         },
       })
@@ -220,9 +227,24 @@ async function startCLI() {
       for await (const event of eventStream) {
         if (event.event === 'on_tool_start') {
           if (streaming) { process.stdout.write('\n'); streaming = false; }
-          updateSpinner(`툴 실행: ${event.name}`);
+          if (displayState.thinking) {
+            // 펼침: 도구 이름과 입력을 남긴다 (/thinking 로 전환)
+            stopSpinner();
+            printTrace(`▸ 도구 호출: ${event.name}`, event.data?.input);
+            startSpinner(`툴 실행: ${event.name}`);
+          } else {
+            updateSpinner(`툴 실행: ${event.name}`);
+          }
         } else if (event.event === 'on_tool_end') {
-          updateSpinner('생각 중...');
+          // use_skill 결과는 /skills 펼침 시 이미 전문이 출력되므로 중복 출력하지 않는다
+          const skipTrace = event.name === 'use_skill' && displayState.skills;
+          if (displayState.thinking && !skipTrace) {
+            stopSpinner();
+            printTrace(`◂ 도구 결과: ${event.name}`, event.data?.output);
+            startSpinner('생각 중...');
+          } else {
+            updateSpinner('생각 중...');
+          }
         } else if (event.event === 'on_llm_stream') {
           const raw   = event.data?.chunk?.message?.content ?? '';
           const chunk = Array.isArray(raw)
