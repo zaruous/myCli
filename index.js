@@ -8,7 +8,7 @@
  * 슬래시 명령어 → lib/commands.js
  * 스피너      → lib/ui.js
  */
-import search from "./search/search/dist/index.js";
+import search from "@inquirer/search";
 import fs from "fs/promises";
 import path from "path";
 import 'dotenv/config';
@@ -25,7 +25,7 @@ import { loadMcpTools } from './lib/mcp.js';
 import { loadAliases, resolveAlias, suggestCommand } from './lib/ux-manager.js';
 import { startSpinner, updateSpinner, stopSpinner, promptWithHistory, confirmPrompt, inputPrompt } from './lib/ui.js';
 import { baseTools } from './lib/tools.js';
-import { memory, createAgentExecutor } from './lib/agent.js';
+import { memory, createAgentExecutor, trimMemory } from './lib/agent.js';
 import { registerCommands } from './lib/commands.js';
 import { DynamicStructuredTool } from "@langchain/core/tools";
 import { z } from "zod";
@@ -253,6 +253,12 @@ async function startCLI() {
       }
       process.stdout.write('\n');
       await memory.saveContext({ input: userInput }, { output: String(finalOutput) });
+
+      // 컨텍스트 한도를 넘으면 오래된 대화를 정리 (모델 호출 실패 방지)
+      const { trimmed } = await trimMemory(memory);
+      if (trimmed > 0) {
+        console.log(chalk.gray(`[컨텍스트] 한도 초과로 오래된 메시지 ${trimmed}개를 정리했습니다. (/compact 로 요약 보존 가능)`));
+      }
 
       // Stop 훅 발행
       await emitHook('Stop', {

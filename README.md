@@ -19,10 +19,11 @@ mycli/
 │   ├── history.js        # 명령어 히스토리 (↑↓ 탐색)
 │   ├── skills.js         # 스킬 시스템 (SKILL.md 로드·실행)
 │   ├── context.js        # 프로젝트 컨텍스트 파일 로드 (mycli.md)
-│   ├── mcp.js            # MCP(Model Context Protocol) 클라이언트
+│   ├── mcp.js            # MCP(Model Context Protocol) 클라이언트 (stdio·HTTP)
+│   ├── hooks.js          # 훅 로더·이벤트 발행·실행 엔진
+│   ├── hook-logger.js    # 훅 이벤트 SQLite 로거
 │   └── ux-manager.js     # 별칭(alias), 명령어 추천, 페이지네이션
 ├── mcps/                 # MCP 서버 설정 파일 (*.json)
-├── search/               # @ 파일 선택 UI (inquirer/search 기반)
 ├── docs/                 # 개발 문서
 └── .mycli/
     └── skills/           # 로컬 스킬 디렉터리
@@ -46,6 +47,7 @@ mycli/
 | `git_diff` | git diff 출력 |
 | `git_log` | git 커밋 로그 출력 |
 | `enter_plan_mode` / `exit_plan_mode` | 계획 모드 진입/종료. 계획 모드에서는 파일 수정·명령 실행이 차단됨 |
+| `get_datetime` | OS의 현재 날짜·시간·타임존 반환 |
 | `use_skill` | 등록된 스킬을 AI가 직접 호출 |
 
 ### 슬래시 명령어
@@ -54,7 +56,7 @@ mycli/
 |--------|------|
 | `/help` | 사용 가능한 명령어 목록 출력 |
 | `/status` | BASE_DIR, 모델, 스킬 등 현재 상태 출력 |
-| `/model [provider]` | 모델 전환 (`gemini` \| `gpt` \| `ollama`) |
+| `/model [provider]` | 모델 전환 (`gemini` \| `gpt` \| `ollama` \| `vllm`) |
 | `/clear` | 대화 기록 초기화 및 화면 지우기 |
 | `/compact` | 대화 기록을 AI로 요약하여 압축 |
 | `/list` | 현재 세션 대화 기록 출력 |
@@ -69,6 +71,8 @@ mycli/
 | `/undo` | 마지막 파일 수정 되돌리기 |
 | `/tree [path]` | 디렉터리 트리 출력 (`--depth N` 지원) |
 | `/alias [name] [cmd]` | 별칭 조회·등록 (`-d name`으로 삭제) |
+| `/hooks` | 로드된 훅 설정 목록 출력 |
+| `/hook-log` | 훅 이벤트 SQLite 로그 조회 (`--event` `--tool` `--limit` `--clear`) |
 | `/<skill-name>` | 스킬 직접 실행 |
 | `/exit` | CLI 종료 |
 
@@ -134,14 +138,35 @@ $ARGUMENTS 에 대해 분석해주세요.
 ### MCP 서버 연동
 
 `mcps/` 디렉터리에 JSON 설정 파일을 추가하면 MCP 서버의 도구가 자동으로 로드됩니다.
+설정 파일은 **작업 디렉터리(BASE_DIR)와 CLI 실행 경로 양쪽**에서 찾습니다.
+
+**stdio 방식** — `command` 필드를 쓰면 자식 프로세스로 서버를 띄웁니다.
 
 ```json
 {
   "name": "my-server",
   "command": "node my-mcp-server.js",
-  "args": []
+  "args": [],
+  "timeout": 5000
 }
 ```
+
+**HTTP 방식** — `url` 필드를 쓰면 Streamable HTTP 로 통신합니다.
+
+```json
+{
+  "name": "remote-server",
+  "url": "https://example.com/mcp",
+  "token": "YOUR_TOKEN",
+  "headers": { "X-Custom": "value" },
+  "timeout": 10000
+}
+```
+
+- `token` 은 `Authorization: Bearer <token>` 헤더로 변환됩니다.
+- `headers` 로 헤더를 추가할 수 있습니다 (`token` 보다 우선순위 낮음).
+- `timeout` 은 요청 하나당 제한 시간(ms)입니다. 생략 시 stdio 5000 / HTTP 10000.
+- JSON 파일에 배열을 넣으면 서버를 여러 개 정의할 수 있습니다.
 
 로드된 MCP 도구는 `mcp_<서버명>_<도구명>` 형태로 AI에게 제공됩니다.
 
@@ -153,6 +178,24 @@ $ARGUMENTS 에 대해 분석해주세요.
 - AI가 `exit_plan_mode`로 계획을 제출하면 사용자가 **승인 / 거절 / 피드백** 선택
 - 승인 후에만 실제 구현 진행
 
+### 에이전트 방식
+
+| provider | 방식 | 이유 |
+|---|---|---|
+| `gemini` · `gpt` · `vllm` | 네이티브 tool calling | 모델이 도구 호출을 구조화된 형태로 직접 내보내므로 파싱 실패가 없고 병렬 호출이 가능 |
+| `ollama` | structured chat (JSON) | `gemma2:9b` 등 로컬 모델 상당수가 네이티브 tool calling 미지원 |
+
+도구를 지원하는 Ollama 모델(예: `llama3.1`, `qwen2.5`)을 쓰더라도 현재는 structured 방식으로 동작합니다.
+
+### 컨텍스트 관리
+
+대화가 길어지면 모델의 컨텍스트 한도를 넘어 요청 자체가 실패합니다.
+`MYCLI_MAX_CONTEXT_TOKENS`(기본 24000) 를 넘으면 **오래된 대화부터 자동으로 정리**하고 알려줍니다.
+
+- 내용을 버리지 않고 요약해서 남기려면 `/compact` 를 쓰세요.
+- `MYCLI_MAX_CONTEXT_TOKENS=0` 으로 자동 정리를 끌 수 있습니다.
+- 토큰 수는 `문자수 / 4` 로 추정한 값이며, 실제 토크나이저 기준이 아닙니다.
+
 ## ⚙️ 요구 사항
 
 - Node.js v18 이상
@@ -163,7 +206,7 @@ $ARGUMENTS 에 대해 분석해주세요.
 ### npm으로 전역 설치
 
 ```bash
-npm install -g mycli
+npm install -g @callakrsos/mycli
 ```
 
 ### 소스에서 직접 실행
@@ -179,7 +222,7 @@ npm install
 `.env` 파일을 생성합니다 (`.env_example` 참고):
 
 ```env
-# AI 공급자 선택 (gemini | gpt | ollama), 기본값: gemini
+# AI 공급자 선택 (gemini | gpt | ollama | vllm), 기본값: gemini
 MYCLI_PROVIDER=gemini
 
 # Google Gemini (기본값)
@@ -192,9 +235,24 @@ OPENAI_API_KEY=YOUR_OPENAI_API_KEY
 OLLAMA_BASE_URL=http://localhost:11434
 OLLAMA_MODEL=gemma2:9b
 
+# vLLM (OpenAI 호환 API)
+VLLM_BASE_URL=http://localhost:8000
+VLLM_API_KEY=EMPTY
+# 생략하면 /v1/models 의 첫 번째 모델을 자동 감지합니다
+VLLM_MODEL=
+
 # 작업 디렉터리 (미설정 시 CLI 실행 경로)
 MYCLI_WORKDIR=C:\Users\yourname\workspace
+
+# 훅 이벤트 SQLite 로깅 (기본 활성, false 로 끄기)
+MYCLI_HOOK_LOG=true
+MYCLI_HOOK_LOG_DB=
+
+# 대화 기록 자동 압축 임계치 (추정 토큰 수, 기본 24000 / 0 이면 비활성)
+MYCLI_MAX_CONTEXT_TOKENS=24000
 ```
+
+`MYCLI_PROVIDER` 를 설정하지 않으면 `GOOGLE_API_KEY` → `OPENAI_API_KEY` → `ollama` 순으로 자동 감지합니다.
 
 ## ▶️ 사용법
 

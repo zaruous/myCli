@@ -21,6 +21,13 @@ import { setBaseDir, getBaseDir, planModeState, readFileState } from '../lib/sta
 import { getSafePath, toBaseRelative } from '../lib/utils.js';
 import { setMockResponses, resetMock } from '../lib/ui.js';
 import { baseTools } from '../lib/tools.js';
+import { McpClient, HttpMcpClient } from '../lib/mcp.js';
+import { getProjectRoots } from '../lib/config-paths.js';
+import { loadProjectContext } from '../lib/context.js';
+import { loadSkills } from '../lib/skills.js';
+import { loadHooks, getLoadedHooks } from '../lib/hooks.js';
+import { trimMemory, estimateTokens, getMaxContextTokens, getAgentMode, createAgentExecutor } from '../lib/agent.js';
+import { BufferMemory } from '@langchain/classic/memory';
 import { hasAttachToken } from '../index.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -314,6 +321,213 @@ async function testPartialWriteGuard() {
 }
 
 // ═══════════════════════════════════════════════════════════
+// R-8 MCP: initialize 후 notifications/initialized 미전송
+//     (기존: 알림을 보내지 않아 스펙을 엄격히 지키는 서버가 tools/list 를 거부)
+// ═══════════════════════════════════════════════════════════
+async function testMcpInitialized() {
+  console.log('\n[R-8] MCP initialized 알림');
+
+  const serverPath = path.join(__dirname, 'fixtures', 'strict-mcp-server.js');
+  const client = new McpClient({
+    name: 'strict-test',
+    command: `node ${JSON.stringify(serverPath)}`,
+    timeout: 5000,
+  });
+
+  try {
+    await client.start();
+    const tools = await client.listTools();
+    assert(tools.length === 1 && tools[0].name === 'echo',
+      `R-8-1: 엄격한 서버에서 tools/list 성공 (${tools.length}개)`);
+
+    const out = await client.callTool('echo', { text: 'hello' });
+    assert(out === 'echo: hello', `R-8-2: tools/call 정상 동작 (응답: ${out})`);
+
+    assert(client.timeout === 5000, 'R-8-3: 설정 파일의 timeout 이 반영됨');
+  } finally {
+    client.stop();
+  }
+
+  // R-8-5: stop() 이 파이프·대기요청을 확실히 정리해야 한다.
+  //        (정리하지 않으면 자식 프로세스 파이프가 남아 CLI 가 종료되지 않는다)
+  {
+    const c = new McpClient({ name: 'leak-test', command: `node ${JSON.stringify(serverPath)}`, timeout: 3000 });
+    await c.start();
+    const child = c.process;
+    const pending = c.callTool('echo', { text: 'x' }).catch(e => e.message);
+    c.stop();
+    const settled = await pending;
+    assert(typeof settled === 'string' && /종료/.test(settled),
+      `R-8-5: stop() 시 대기 중 요청이 거부됨 (${settled})`);
+    assert(child.stdout.destroyed && child.stderr.destroyed, 'R-8-5: stdout/stderr 파이프 해제됨');
+    assert(c.process === null, 'R-8-5: 내부 프로세스 참조 해제됨');
+    c.stop();   // 두 번 호출해도 예외 없음
+    assert(true, 'R-8-5: stop() 중복 호출 안전');
+  }
+
+  // R-8-4: timeout 미지정 시 기본값
+  const dflt = new McpClient({ name: 'x', command: 'node -e ""' });
+  assert(dflt.timeout === 5000, 'R-8-4: stdio 기본 타임아웃 5000ms');
+  const http = new HttpMcpClient({ name: 'y', url: 'http://localhost:1/mcp' });
+  assert(http.timeout === 10000, 'R-8-4: HTTP 기본 타임아웃 10000ms');
+  assert(new HttpMcpClient({ name: 'y', url: 'http://x/', timeout: 30000 }).timeout === 30000,
+    'R-8-4: HTTP timeout 설정 반영');
+}
+
+// ═══════════════════════════════════════════════════════════
+// R-9 설정 파일 탐색: BASE_DIR 이 cwd 와 다를 때 조용히 무시됨
+//     (기존: mycli.md · hooks.json · skills · mcps 를 process.cwd() 에서만 탐색)
+// ═══════════════════════════════════════════════════════════
+async function testConfigDiscovery() {
+  console.log('\n[R-9] BASE_DIR 기준 설정 탐색');
+
+  // TMP_DIR 은 cwd(프로젝트 루트)와 다른 디렉터리다.
+  assert(path.resolve(TMP_DIR) !== path.resolve(process.cwd()), 'R-9-0: BASE_DIR ≠ cwd 전제 확인');
+
+  const roots = getProjectRoots();
+  assert(roots.length === 2 && roots[0] === path.resolve(TMP_DIR),
+    `R-9-1: BASE_DIR 을 우선으로 두 경로 탐색 (${roots.length}개)`);
+
+  // R-9-2: BASE_DIR 의 mycli.md 를 읽는다
+  {
+    await fs.writeFile(path.join(TMP_DIR, 'mycli.md'), '프로젝트 컨텍스트 마커 XYZ', 'utf-8');
+    const ctx = await loadProjectContext();
+    assert(ctx === '프로젝트 컨텍스트 마커 XYZ', `R-9-2: BASE_DIR 의 mycli.md 로드 (${String(ctx).slice(0, 20)})`);
+    await fs.rm(path.join(TMP_DIR, 'mycli.md'), { force: true });
+  }
+
+  // R-9-3: BASE_DIR 의 .mycli/skills 를 읽는다
+  {
+    const skillDir = path.join(TMP_DIR, '.mycli', 'skills', 'r9-skill');
+    await fs.mkdir(skillDir, { recursive: true });
+    await fs.writeFile(path.join(skillDir, 'SKILL.md'),
+      '---\nname: r9-skill\ndescription: 회귀 테스트용\n---\n\n본문', 'utf-8');
+    const skills = await loadSkills();
+    assert(skills.some(s => s.name === 'r9-skill'), `R-9-3: BASE_DIR 의 스킬 로드 (${skills.length}개)`);
+    assert(skills.filter(s => s.name === 'r9-skill').length === 1, 'R-9-3: 같은 이름 스킬 중복 등록 안 됨');
+    await fs.rm(path.join(TMP_DIR, '.mycli'), { recursive: true, force: true });
+  }
+
+  // R-9-4: BASE_DIR 의 .mycli/hooks.json 을 읽는다
+  {
+    const hookDir = path.join(TMP_DIR, '.mycli');
+    await fs.mkdir(hookDir, { recursive: true });
+    await fs.writeFile(path.join(hookDir, 'hooks.json'),
+      JSON.stringify({ hooks: { Stop: [{ matcher: '.*', hooks: [{ type: 'command', command: 'echo r9' }] }] } }), 'utf-8');
+    await loadHooks();
+    const loaded = getLoadedHooks();
+    assert(Array.isArray(loaded.Stop) && loaded.Stop.length > 0,
+      `R-9-4: BASE_DIR 의 hooks.json 로드 (Stop ${loaded.Stop?.length ?? 0}개)`);
+    await fs.rm(hookDir, { recursive: true, force: true });
+    await loadHooks();   // 상태 원복
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
+// R-10 대화 기록 무제한 증가
+//      (기존: BufferMemory 가 한도 없이 쌓여 모델 컨텍스트 초과로 요청 실패)
+// ═══════════════════════════════════════════════════════════
+async function testMemoryTrim() {
+  console.log('\n[R-10] 컨텍스트 상한');
+
+  const saved = process.env.MYCLI_MAX_CONTEXT_TOKENS;
+  const mem = new BufferMemory({ memoryKey: 'chat_history', returnMessages: true });
+
+  // 한 쌍당 약 500 토큰 (2000자) × 20쌍 ≈ 10000 토큰
+  const chunk = 'X'.repeat(1000);
+  for (let i = 0; i < 20; i++) {
+    await mem.saveContext({ input: `질문${i} ${chunk}` }, { output: `답변${i} ${chunk}` });
+  }
+
+  const before = (await mem.loadMemoryVariables({})).chat_history;
+  assert(before.length === 40, `R-10-1: 대화 40개 누적 (${before.length})`);
+  assert(estimateTokens(before) > 5000, `R-10-1: 추정 토큰 ${estimateTokens(before)} > 5000`);
+
+  // R-10-2: 상한을 넘으면 오래된 것부터 정리되고 최근 대화는 남는다
+  {
+    process.env.MYCLI_MAX_CONTEXT_TOKENS = '2000';
+    const res = await trimMemory(mem);
+    const after = (await mem.loadMemoryVariables({})).chat_history;
+    const text = after.map(m => m.content).join('\n');
+
+    assert(res.trimmed > 0, `R-10-2: 오래된 메시지 정리됨 (${res.trimmed}개)`);
+    assert(estimateTokens(after) <= 2000, `R-10-2: 상한 이하로 축소 (${estimateTokens(after)} ≤ 2000)`);
+    assert(after.length > 0, 'R-10-2: 최소한의 대화는 보존');
+    assert(text.includes('질문19'), 'R-10-2: 가장 최근 대화는 보존됨');
+    assert(!text.includes('질문0 '), 'R-10-2: 가장 오래된 대화는 제거됨');
+    assert(after.length % 2 === 0, 'R-10-2: human/ai 쌍이 깨지지 않음');
+
+    // 역할이 human/ai 순으로 유지돼야 한다 (메시지 단위로 자르면 뒤바뀐다)
+    const rolesOk = after.every((m, i) => m._getType() === (i % 2 === 0 ? 'human' : 'ai'));
+    assert(rolesOk, `R-10-2: 역할 순서 보존 (${after.map(m => m._getType()).slice(0, 4).join(',')})`);
+    assert(after[0].content.startsWith('질문'), 'R-10-2: 첫 메시지가 사용자 질문으로 시작');
+  }
+
+  // R-10-3: 상한 이하면 아무것도 건드리지 않는다
+  {
+    process.env.MYCLI_MAX_CONTEXT_TOKENS = '100000';
+    const countBefore = (await mem.loadMemoryVariables({})).chat_history.length;
+    const res = await trimMemory(mem);
+    const countAfter = (await mem.loadMemoryVariables({})).chat_history.length;
+    assert(res.trimmed === 0 && countBefore === countAfter, 'R-10-3: 한도 이내면 정리하지 않음');
+  }
+
+  // R-10-4: 0 이면 기능 비활성
+  {
+    process.env.MYCLI_MAX_CONTEXT_TOKENS = '0';
+    assert(getMaxContextTokens() === 0, 'R-10-4: 0 이면 비활성');
+    const res = await trimMemory(mem);
+    assert(res.trimmed === 0, 'R-10-4: 비활성 시 정리하지 않음');
+  }
+
+  // R-10-5: 잘못된 값이면 기본값으로 폴백
+  {
+    process.env.MYCLI_MAX_CONTEXT_TOKENS = 'abc';
+    assert(getMaxContextTokens() === 24000, `R-10-5: 잘못된 값 → 기본 24000 (${getMaxContextTokens()})`);
+    delete process.env.MYCLI_MAX_CONTEXT_TOKENS;
+    assert(getMaxContextTokens() === 24000, 'R-10-5: 미설정 → 기본 24000');
+  }
+
+  if (saved === undefined) delete process.env.MYCLI_MAX_CONTEXT_TOKENS;
+  else process.env.MYCLI_MAX_CONTEXT_TOKENS = saved;
+}
+
+// ═══════════════════════════════════════════════════════════
+// R-11 에이전트 방식
+//      structured chat 은 모델에게 JSON 을 글로 쓰게 하는 방식이라 파싱 실패가 잦다.
+//      네이티브 tool calling 지원 provider 는 tool-calling 방식을 써야 한다.
+//      (ollama 는 gemma2:9b 등 도구 미지원 모델이 많아 structured 유지)
+// ═══════════════════════════════════════════════════════════
+async function testAgentMode() {
+  console.log('\n[R-11] 에이전트 방식 선택');
+
+  assert(getAgentMode('gemini') === 'tool-calling', 'R-11-1: gemini → tool-calling');
+  assert(getAgentMode('gpt')    === 'tool-calling', 'R-11-1: gpt → tool-calling');
+  assert(getAgentMode('vllm')   === 'tool-calling', 'R-11-1: vllm → tool-calling');
+  assert(getAgentMode('ollama') === 'structured',   'R-11-2: ollama → structured 유지 (도구 미지원 모델 보호)');
+  assert(getAgentMode('알수없음') === 'structured', 'R-11-2: 알 수 없는 provider → structured 폴백');
+
+  // 실제 LLM 호출 없이 만들 수 있는 범위까지 검증한다 (더미 키로 구성만)
+  const savedKeys = { GOOGLE_API_KEY: process.env.GOOGLE_API_KEY, OPENAI_API_KEY: process.env.OPENAI_API_KEY };
+  process.env.GOOGLE_API_KEY = 'dummy-for-construction';
+  process.env.OPENAI_API_KEY = 'dummy-for-construction';
+
+  const toolSubset = baseTools.slice(0, 3);
+  try {
+    for (const provider of ['gemini', 'gpt', 'ollama']) {
+      const executor = await createAgentExecutor(null, toolSubset, [], provider);
+      assert(executor && typeof executor.streamEvents === 'function',
+        `R-11-3: ${provider} AgentExecutor 생성 성공`);
+      assert(executor.tools.length === toolSubset.length, `R-11-3: ${provider} 도구 바인딩 개수 일치`);
+    }
+  } finally {
+    for (const [k, v] of Object.entries(savedKeys)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
 async function main() {
   console.log('\x1b[1m' + '='.repeat(55) + '\x1b[0m');
   console.log('  mycli 회귀 테스트 (실제 재현된 버그)');
@@ -328,6 +542,10 @@ async function main() {
     await testShellCommand();
     await testExecuteCodeEnv();
     await testPartialWriteGuard();
+    await testMcpInitialized();
+    await testConfigDiscovery();
+    await testMemoryTrim();
+    await testAgentMode();
   } finally {
     await teardown();
   }
