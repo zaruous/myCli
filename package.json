@@ -8,13 +8,15 @@
     "start": "node index.js",
     "test": "node test/test-new-features.js",
     "test:integration": "node test/test-integration.js",
-    "test:all": "node test/test-new-features.js && node test/test-integration.js",
+    "test:regression": "node test/test-regression.js",
+    "test:all": "node test/test-new-features.js && node test/test-integration.js && node test/test-regression.js",
     "test:coverage": "c8 --reporter=text --reporter=html --include=index.js --include=lib/**/*.js node test/test-new-features.js"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@inquirer/search": "^3.2.1",
     "@langchain/classic": "^1.0.15",
     "@langchain/core": "^1.1.19",
     "@langchain/google-genai": "^2.1.15",
@@ -24,9 +26,7 @@
     "chalk": "^5.6.2",
     "commander": "^14.0.3",
     "dotenv": "^17.2.4",
-    "express": "^4.17.1",
     "glob": "^13.0.1",
-    "inquirer": "^13.2.2",
     "zod": "^4.3.6"
   },
   "bin": {
