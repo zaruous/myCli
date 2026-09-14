@@ -39,7 +39,7 @@ mycli/
 | `edit_file` | 파일의 특정 문자열만 교체. `replace_all` 옵션 지원 |
 | `glob_files` | 글로브 패턴으로 파일 검색 (최근 수정 순 정렬) |
 | `grep_files` | 정규식으로 파일 내용 검색. ripgrep 우선, JS 폴백 |
-| `execute_shell_command` | 안전 모드에서 셸 명령어 실행 |
+| `execute_shell_command` | 셸 명령어 실행 (Windows: PowerShell / 그 외: `/bin/sh`). 실행 전 확인 |
 | `execute_code` | Node.js 코드를 직접 작성하여 샌드박스에서 실행 |
 | `install_package` | npm 패키지를 샌드박스에 설치 |
 | `git_status` | git 상태 확인 |
@@ -80,7 +80,10 @@ mycli/
 KYJ_AI > @package.json 이 파일의 의존성을 분석해줘
 ```
 
-- 입력 중 `@`를 타이핑하면 즉시 파일 선택 UI가 열립니다.
+- 입력 중 `@`를 타이핑하면 즉시 파일 선택 UI가 열립니다. (단어 중간의 `@`는 무시되므로
+  `kyj@example.com` 이나 `express@4` 같은 입력은 일반 메시지로 처리됩니다.)
+- 경로를 직접 적으면 선택 UI 없이 바로 첨부됩니다. **절대경로도 지원**합니다:
+  `@/home/user/proj/lib/tools.js 설명해줘`
 - 여러 파일을 동시에 첨부할 수 있습니다: `@index.js @lib/tools.js 비교해줘`
 
 ### 멀티라인 입력
@@ -205,11 +208,23 @@ node index.js
 
 ## 🔒 보안
 
-- `BASE_DIR` 외부 경로 접근 차단 (경로 탈출 방지)
-- `rm -rf`, `del`, `sudo`, `shutdown` 등 위험 명령어 차단
+- `BASE_DIR` 외부 경로 접근 차단 (`path.relative` 기반 — 접두사가 겹치는 형제 디렉터리도 차단)
+- 파일을 변경하거나 명령을 실행하기 전에 **항상 사용자 확인**을 받음
+  (`write_file`, `edit_file`, `execute_shell_command`, `execute_code`, `install_package`)
 - 파일 수정 시 read-before-write 강제 및 외부 수정 감지 (mtime 기반)
-- `execute_code`는 격리된 샌드박스 디렉터리에서만 실행
+- 일부 범위만 읽은 파일의 전체 덮어쓰기 차단 (읽지 않은 내용 손실 방지)
+- `install_package`의 패키지명 형식 검증 + 셸을 거치지 않는 실행 (인자 주입 방지)
+- `execute_code` 자식 프로세스에서 API 키·토큰 환경변수 제거
 - 계획 모드에서 파일 수정·명령 실행 차단
+
+### ⚠️ 보안 한계 (알고 쓰세요)
+
+- `rm`, `sudo`, `shutdown` 등의 **차단 목록은 보조 수단일 뿐 방어선이 아닙니다.**
+  구분자(`;`, `&&`, `|`)로 나눈 각 구간의 명령어까지 검사하지만, 차단 목록에 없는
+  명령으로 얼마든지 같은 피해를 낼 수 있습니다. **실질적인 안전장치는 실행 전 확인 프롬프트입니다.**
+- `execute_code`의 "샌드박스"는 **별도의 작업 디렉터리일 뿐 격리가 아닙니다.**
+  실행되는 코드는 파일 시스템과 네트워크에 제한 없이 접근할 수 있습니다.
+  신뢰할 수 없는 내용을 다룰 때는 컨테이너나 VM 안에서 CLI를 실행하세요.
 
 ## 📄 라이선스
 

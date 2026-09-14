@@ -860,9 +860,11 @@ async function testInstallPackage() {
     return;
   }
 
-  // 12-1: 소형 패키지(is-odd) 설치 → 성공 메시지
+  // 12-1: 소형 패키지(is-odd) 설치 → 성공 메시지 (설치 전 사용자 확인 승인)
   {
+    setMockResponses([true]);
     const result = await tool.func({ packages: ['is-odd'] });
+    resetMock();
     assert(
       result.includes('설치') || result.includes('완료') || result.includes('added') || result.includes('up to date'),
       'IT-12-1: 패키지 설치 성공 메시지 반환'
@@ -871,7 +873,9 @@ async function testInstallPackage() {
 
   // 12-2: 결과가 문자열 타입
   {
+    setMockResponses([true]);
     const result = await tool.func({ packages: ['is-odd'] });
+    resetMock();
     assert(typeof result === 'string' && result.length > 0,
       'IT-12-2: 설치 결과가 비어 있지 않은 문자열');
   }

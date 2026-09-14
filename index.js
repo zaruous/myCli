@@ -17,7 +17,7 @@ import chalk from 'chalk';
 import { Command } from 'commander';
 
 import { getBaseDir, planModeState, getCurrentInput, setCurrentInput } from './lib/state.js';
-import { getSafePath } from './lib/utils.js';
+import { getSafePath, toBaseRelative } from './lib/utils.js';
 import { loadHistory, saveHistory, getHistory } from './lib/history.js';
 import { loadSkills } from './lib/skills.js';
 import { loadProjectContext } from './lib/context.js';
@@ -31,6 +31,25 @@ import { DynamicStructuredTool } from "@langchain/core/tools";
 import { z } from "zod";
 import { loadHooks, emitHook } from './lib/hooks.js';
 import { initHookLogger } from './lib/hook-logger.js';
+
+// =========================================================
+// 입력 파싱 헬퍼
+// =========================================================
+/**
+ * '@' 파일 첨부 토큰이 있는지 판별한다.
+ * 문자열 어딘가에 '@' 가 있는지가 아니라 "토큰이 @로 시작"하는지를 본다.
+ * (kyj@example.com, express@4 같은 평범한 입력이 첨부 모드로 새는 것을 막음)
+ * @param {string} input
+ * @returns {boolean}
+ */
+export function hasAttachToken(input) {
+  return String(input).trim().split(/\s+/).some(t => t.startsWith('@'));
+}
+
+/** 경로가 실제 파일인지 확인 (디렉터리는 false) */
+async function isExistingFile(absPath) {
+  try { return (await fs.stat(absPath)).isFile(); } catch { return false; }
+}
 
 // =========================================================
 // startCLI
@@ -266,6 +285,15 @@ async function startCLI() {
     const selectedFiles = [];
     for (const token of atTokens) {
       const keyword = token.length > 1 ? token.slice(1) : '';
+
+      // 이미 실존하는 경로를 직접 적어준 경우(절대경로 포함) 선택 UI 를 건너뛴다.
+      // 예: '@/home/user/proj/lib/tools.js', '@lib/tools.js'
+      const direct = keyword ? toBaseRelative(keyword) : null;
+      if (direct && direct !== '.' && await isExistingFile(path.join(getBaseDir(), direct))) {
+        selectedFiles.push(direct);
+        continue;
+      }
+
       console.log(chalk.gray(`\n파일 선택 중 (키워드: ${keyword || '전체'})...`));
       const file = await selectFile(keyword);
       if (file) selectedFiles.push(file);
@@ -369,7 +397,7 @@ async function startCLI() {
             askQuestion();
           }
         }
-      } else if (processInput.includes('@')) {
+      } else if (hasAttachToken(processInput)) {
         await handleAttach(userInput);
       } else {
         await handleChat(userInput);
@@ -411,16 +439,26 @@ async function selectFile(initialInput = '') {
     cwd: getBaseDir(),
     ignore: ['node_modules/**', '.git/**', '*.env', '**/node_modules/**', '**/.git/**', '.m2/**', '.idea/**'],
   });
-  const initialFiles = initialInput
-    ? allFiles.filter(f => f.toLowerCase().includes(initialInput.toLowerCase()))
-    : allFiles;
+  // allFiles 는 BASE_DIR 기준 상대경로다. 절대경로가 들어오면 그대로 대조해도
+  // 절대 일치하지 않으므로 상대경로로 정규화한 뒤 필터링한다.
+  const normalize = (input) => {
+    if (!input) return '';
+    const rel = toBaseRelative(input);
+    return rel && rel !== '.' ? rel : input;
+  };
+
+  const filterFiles = (input) => {
+    const key = normalize(input).toLowerCase();
+    return key ? allFiles.filter(f => f.toLowerCase().includes(key)) : allFiles;
+  };
+
+  const initialFiles = filterFiles(initialInput);
 
   return await search({
     message: '첨부할 파일을 선택하세요:',
     source: async (input) => {
       if (input === undefined) return initialFiles;
-      if (!input) return allFiles;
-      return allFiles.filter(f => f.toLowerCase().includes(input.toLowerCase()));
+      return filterFiles(input);
     },
   });
 }

@@ -8,7 +8,8 @@
     "start": "node index.js",
     "test": "node test/test-new-features.js",
     "test:integration": "node test/test-integration.js",
-    "test:all": "node test/test-new-features.js && node test/test-integration.js",
+    "test:regression": "node test/test-regression.js",
+    "test:all": "node test/test-new-features.js && node test/test-integration.js && node test/test-regression.js",
     "test:coverage": "c8 --reporter=text --reporter=html --include=index.js --include=lib/**/*.js node test/test-new-features.js"
   },
   "keywords": [],
