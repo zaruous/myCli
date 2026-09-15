@@ -10,7 +10,7 @@ mycli/
 ├── lib/
 │   ├── agent.js          # LLM 모델 팩토리, AgentExecutor 생성
 │   ├── commands.js       # 슬래시 명령어 등록 (/help, /model, /plan 등)
-│   ├── tools.js          # AI 도구 정의 (read/write/edit/grep/git/execute_code 등)
+│   ├── tools.js          # 기능별 도구 모듈을 baseTools로 집계하는 진입점
 │   ├── ui.js             # 스피너, readline 프롬프트, Tab 자동완성
 │   ├── code-manager.js   # 파일 변경 이력, undo 관리
 │   ├── diff.js           # LCS 기반 라인 diff 렌더링
@@ -24,6 +24,19 @@ mycli/
 │   ├── hook-logger.js    # 훅 이벤트 SQLite 로거
 │   └── ux-manager.js     # 별칭(alias), 명령어 추천, 페이지네이션
 ├── mcps/                 # MCP 서버 설정 파일 (*.json)
+├── tools/                # AI 도구 구현 (도메인별 모듈)
+│   ├── file/             # 파일 도구
+│   │   ├── read-tool.js  # 파일 읽기
+│   │   ├── write-tool.js # 파일 생성·전체 쓰기
+│   │   ├── edit-tool.js  # 파일 부분 편집
+│   │   ├── glob-tool.js  # 파일명 검색
+│   │   ├── grep-tool.js  # 파일 내용 검색
+│   │   └── index.js      # 파일 도구 배열 조립
+│   ├── utils/            # ripgrep·JS grep·git 실행 공통 헬퍼
+│   ├── git/              # git status·diff·log
+│   ├── plan/             # 계획 모드 진입·종료
+│   └── runtime/          # 셸·날짜·패키지·코드 실행
+├── search/               # @ 파일 선택 UI (inquirer/search 기반)
 ├── docs/                 # 개발 문서
 └── .mycli/
     └── skills/           # 로컬 스킬 디렉터리

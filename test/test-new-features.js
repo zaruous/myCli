@@ -529,11 +529,25 @@ async function testLibModulesCoverage() {
     assert(result === path.join(TMP_DIR, 'test.txt'), '22-1: getSafePath 정상 경로 반환');
   }
 
+  // 22-1-1: 절대경로도 작업 디렉터리 안이면 그대로 허용
+  {
+    setBaseDir(TMP_DIR);
+    const absolutePath = path.join(TMP_DIR, 'absolute.txt');
+    assert(getSafePath(absolutePath) === absolutePath, '22-1-1: 절대경로 정상 처리');
+  }
+
   // 22-2: getSafePath 경로 탈출 차단
   {
     let threw = false;
     try { getSafePath('../../etc/passwd'); } catch { threw = true; }
     assert(threw, '22-2: getSafePath 경로 탈출 시 에러');
+  }
+
+  // 22-2-1: baseDir 접두사만 같은 형제 디렉터리도 차단
+  {
+    let threw = false;
+    try { getSafePath(`${TMP_DIR}-sibling/file.txt`); } catch { threw = true; }
+    assert(threw, '22-2-1: baseDir 접두사 형제 경로 차단');
   }
 
   // 22-3: getTimestamp ISO 형식
