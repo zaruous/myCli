@@ -15,6 +15,10 @@ import { spawn } from 'child_process';
 
 // ── lib 모듈 직접 임포트 ────────────────────────────────────
 import { getBaseDir, setBaseDir, planModeState, readFileState, getCurrentInput, setCurrentInput } from '../lib/state.js';
+import { displayState } from '../lib/state.js';
+import { resolveToggle, toTraceText, TRACE_MAX_CHARS } from '../lib/ui.js';
+import { registerCommands } from '../lib/commands.js';
+import { Command } from 'commander';
 import { getSafePath, getTimestamp } from '../lib/utils.js';
 import { computeLineDiff, renderDiffWithContext } from '../lib/diff.js';
 import { loadSkills } from '../lib/skills.js';
@@ -1192,6 +1196,89 @@ async function testHookEdgeCases() {
 // ═══════════════════════════════════════════════════════════
 // 실행
 // ═══════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════
+// Test 27: /thinking · /skills 표시 접기/펴기
+// ═══════════════════════════════════════════════════════════
+async function testDisplayToggles() {
+  console.log('\n[Test 27] /thinking · /skills 표시 접기/펴기');
+
+  // 27-1: 기본값은 모두 접힘
+  assert(displayState.thinking === false && displayState.skills === false, '27-1: 기본값 thinking=false, skills=false');
+
+  // 27-2: resolveToggle — 인자 생략 시 토글, on/off 명시, 잘못된 값은 null
+  assert(resolveToggle(undefined, false) === true,  '27-2: 인자 없음 → 반전 (false→true)');
+  assert(resolveToggle(undefined, true)  === false, '27-2: 인자 없음 → 반전 (true→false)');
+  assert(resolveToggle('on',  false) === true,      '27-2: "on" → true');
+  assert(resolveToggle('OFF', true)  === false,     '27-2: "OFF" (대소문자 무시) → false');
+  assert(resolveToggle('maybe', false) === null,    '27-2: 잘못된 값 → null');
+
+  // 27-3: toTraceText — 문자열/객체/메시지/절단
+  assert(toTraceText('abc') === 'abc',                              '27-3: 문자열 그대로');
+  assert(toTraceText({ path: 'a.txt' }) === '{\n  "path": "a.txt"\n}', '27-3: 객체 → JSON');
+  assert(toTraceText(null) === '' && toTraceText(undefined) === '', '27-3: null/undefined → 빈 문자열');
+  {
+    const msgLike = { content: '도구 결과', _getType: () => 'tool' };
+    assert(toTraceText(msgLike) === '도구 결과', '27-3: LangChain 메시지 → content');
+  }
+  {
+    const long = 'x'.repeat(TRACE_MAX_CHARS + 20);
+    const out  = toTraceText(long);
+    assert(out.startsWith('x'.repeat(TRACE_MAX_CHARS)) && out.endsWith('(20자 생략)'), `27-3: ${TRACE_MAX_CHARS}자 초과 시 절단 + 생략 표시`);
+    assert(toTraceText(long, Infinity) === long, '27-3: max=Infinity 면 절단 없음');
+  }
+
+  // 27-4: 실제 커맨드 등록 후 /thinking, /skills 파싱 → displayState 변경
+  {
+    const program = new Command();
+    program.exitOverride();
+    const chats = [];
+    const cliState = {
+      memory: { loadMemoryVariables: async () => ({ chat_history: [] }) },
+      tools: [], mcpTools: [], projectContext: null, executor: null, currentProvider: 'gemini',
+      skills: [{ name: 'demo', description: 'demo skill', prompt: 'DEMO $ARGUMENTS', disableModelInvocation: false }],
+    };
+    registerCommands(program, cliState, { askQuestion: () => {}, handleChat: async (p) => { chats.push(p); } });
+    const names = program.commands.map(c => c.name());
+    assert(names.includes('/thinking') && names.includes('/skills'), '27-4: /thinking, /skills 명령 등록됨');
+
+    // 콘솔 출력 캡처 — assert 도 console.log 를 쓰므로, 캡처 구간에서는 결과만 모아 두고 복원 후 검증한다
+    const origLog = console.log, origWrite = process.stdout.write.bind(process.stdout);
+    let captured = '';
+    const checks = [];
+    console.log = (...a) => { captured += a.join(' ') + '\n'; };
+    process.stdout.write = (str) => { captured += String(str); return true; };
+    try {
+      await program.parseAsync(['/thinking'], { from: 'user' });
+      checks.push([displayState.thinking === true, '27-4: /thinking (인자 없음) → 펼침']);
+      await program.parseAsync(['/thinking', 'off'], { from: 'user' });
+      checks.push([displayState.thinking === false, '27-4: /thinking off → 접힘']);
+      await program.parseAsync(['/thinking', 'bogus'], { from: 'user' });
+      checks.push([displayState.thinking === false && captured.includes('잘못된 값'), '27-4: /thinking bogus → 상태 유지 + 오류 메시지']);
+
+      await program.parseAsync(['/skills', 'on'], { from: 'user' });
+      checks.push([displayState.skills === true, '27-4: /skills on → 펼침']);
+
+      // 27-5: 스킬 펼침 상태에서 /demo 실행 시 주입 프롬프트가 출력되고 handleChat 에 전달됨
+      captured = '';
+      await program.parseAsync(['/demo', 'hello'], { from: 'user' });
+      checks.push([chats[0] === 'DEMO hello', '27-5: /demo hello → handleChat("DEMO hello")']);
+      checks.push([captured.includes('DEMO hello'), '27-5: /skills 펼침 시 스킬 프롬프트 전문 출력']);
+
+      // 27-6: 접힘 상태에서는 프롬프트 전문을 출력하지 않음
+      await program.parseAsync(['/skills', 'off'], { from: 'user' });
+      captured = '';
+      await program.parseAsync(['/demo', 'world'], { from: 'user' });
+      checks.push([chats[1] === 'DEMO world' && !captured.includes('DEMO world'), '27-6: /skills 접힘 시 프롬프트 미출력']);
+    } finally {
+      console.log = origLog;
+      process.stdout.write = origWrite;
+      displayState.thinking = false;
+      displayState.skills   = false;
+    }
+    for (const [ok, label] of checks) assert(ok, label);
+  }
+}
+
 async function run() {
   console.log('='.repeat(50));
   console.log(' mycli 신규 기능 테스트');
@@ -1213,6 +1300,7 @@ async function run() {
   await testHooks();
   await testHookLogger();
   await testHookEdgeCases();
+  await testDisplayToggles();
 
   await teardown();
 
